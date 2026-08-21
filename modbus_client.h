@@ -1,0 +1,87 @@
+#ifndef MODBUS_CLIENT_H
+#define MODBUS_CLIENT_H
+
+#include <QObject>
+#include <QTcpSocket>
+#include <QTimer>
+
+/**
+ * @brief Клас для роботи з ModBus TCP клієнтом (синхронний режим).
+ */
+class ModBusClient : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit ModBusClient(QObject *parent = nullptr);
+    ~ModBusClient();
+
+    // Налаштування
+    void setConnectionParams(const QString &ipAddress, quint16 port);
+    void setTimeout(int ms);
+    void setWordOrder(bool lswFirst);
+    void setUnitId(quint8 unitId);
+    void setAddressOffset(int offset);
+
+    // Підключення
+    bool connectToPLC();
+    void disconnectFromPLC();
+    bool isConnected() const;
+    bool isConnecting() const;
+
+    // 16-бітні Holding Registers
+    bool readHoldingRegister(quint16 address, quint16 &result);
+    bool writeHoldingRegister(quint16 address, quint16 value);
+
+    // 32-бітні Holding Registers (окремі методи для int32 та float)
+    bool readHoldingRegister32Int(quint16 address, quint32 &result, bool lswFirst = true);
+    bool readHoldingRegister32Float(quint16 address, float &result, bool lswFirst = true);
+    bool writeHoldingRegister32Int(quint16 address, quint32 value, bool lswFirst = true);
+    bool writeHoldingRegister32Float(quint16 address, float value, bool lswFirst = true);
+
+    // Coils
+    bool readCoil(quint16 address, bool &result);
+    bool writeCoil(quint16 address, bool value);
+
+    // Discrete Inputs
+    bool readDiscreteInput(quint16 address, bool &result);
+
+signals:
+    void connected();
+    void disconnected();
+    void errorOccurred(const QString &errorText);
+    void logMessage(const QString &message);
+
+private slots:
+    void onSocketConnected();
+    void onSocketDisconnected();
+    void onSocketError(QAbstractSocket::SocketError socketError);
+
+private:
+    // Методи формування запитів (PDU)
+    QByteArray buildReadHoldingRegisters(quint16 address, quint16 count);
+    QByteArray buildWriteSingleRegister(quint16 address, quint16 value);
+    QByteArray buildWriteMultipleRegisters(quint16 address, quint16 count, const QByteArray &data);
+    QByteArray buildReadCoils(quint16 address, quint16 count);
+    QByteArray buildWriteSingleCoil(quint16 address, bool value);
+    QByteArray buildReadDiscreteInputs(quint16 address, quint16 count);
+
+    // Відправка запиту та отримання відповіді
+    bool sendRequestAndWaitForResponse(const QByteArray &request, QByteArray &response);
+    bool checkException(const QByteArray &response);
+
+    // Допоміжні методи
+    quint16 adjustAddress(quint16 address) const;
+
+    QTcpSocket *m_socket;
+    QString m_ipAddress;
+    quint16 m_port;
+    quint8 m_unitId;
+    int m_timeoutMs;
+    bool m_connected;
+    quint16 m_transactionId;
+    bool m_lswFirst;
+    int m_addressOffset;   // зсув адреси (за замовчуванням 0)
+};
+
+#endif // MODBUS_CLIENT_H

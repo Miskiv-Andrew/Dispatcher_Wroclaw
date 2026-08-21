@@ -1,0 +1,53 @@
+# ---- Qt / C++ ----
+*.o
+*.obj
+*.lo
+*.la
+*.al
+*.libs
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+*.app
+
+# ---- Qt Creator ----
+*.pro.user
+*.pro.user.*
+*.qbs.user
+*.qbs.user.*
+*.qmlproject.user
+*.qmlproject.user.*
+*.autosave
+
+# ---- Build directories ----
+/build/
+/bin/
+/lib/
+/debug/
+/release/
+
+# ---- Qt specific ----
+*.moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# ---- Logs & temp ----
+*.log
+*.cache
+*.tmp
+*.swp
+*.bak
+
+# ---- CMake ----
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ---- Other IDEs ----
+.vscode/
+.idea/

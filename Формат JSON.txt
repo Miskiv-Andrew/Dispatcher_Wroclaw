@@ -1,0 +1,73 @@
+Формат 1: Python → ModBusBridge (запись данных в ПЛК)
+
+{
+    "type": "write",
+    "data": {
+        "zb": [
+            {
+                "number": 1,
+                "sn": 2800073,
+                "temperature": 22.5,
+                "paed": 12.3,
+                "isotopes": [
+                    {
+                        "id": 1,
+                        "name": 3,
+                        "activity": 5.2,
+                        "concentration": 0.3
+                    },
+                    {
+                        "id": 2,
+                        "name": 2,
+                        "activity": 3.1,
+                        "concentration": 0.2
+                    }
+                ],
+                "high_sensitivity": 0,
+                "low_sensitivity": 0,
+                "valid": 1,
+                "device_connection": 1,
+                "ready_to_drain": 0
+            }
+        ],
+        "cz": [
+            {
+                "number": 1,
+                "sn": 2800074,
+                "temperature": 21.0,
+                "paed": 8.7,
+                "high_sensitivity": 0,
+                "low_sensitivity": 0,
+                "valid": 1,
+                "device_connection": 1
+            }
+        ],
+        "replacement": {
+            "zb_number": 2,
+            "new_sn": 2800099
+        }
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////
+
+
+Формат 2: ModBusBridge → Python (чтение состояния баков)
+
+
+
+{
+    "type": "read",
+    "data": {
+        "zb": [
+            {
+                "number": 1,
+                "fullness": 1
+            },
+            {
+                "number": 2,
+                "fullness": 0
+            }
+        ]
+    }
+}
