@@ -295,6 +295,20 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------------------
     ApplicationController applicationController;
 
+
+    // ------------------------------------------------------------------------
+    // Перед завершением Qt event loop выполняем контролируемый shutdown.
+    //
+    // Это принципиально отличается от попытки закрывать соединения
+    // уже в деструкторах: здесь event loop ещё существует, а все основные
+    // QObject находятся в рабочем и предсказуемом состоянии.
+    // ------------------------------------------------------------------------
+    QObject::connect(
+        &app,
+        &QCoreApplication::aboutToQuit,
+        &applicationController,
+        &ApplicationController::shutdown
+    );
     // ------------------------------------------------------------
     // 2. Створення клієнта ModBus
     // ------------------------------------------------------------
@@ -411,14 +425,17 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------
     // 4. Таймер опитування ПЛК (кожні 5 секунд)
     // ------------------------------------------------------------
-    g_pollTimer = new QTimer();
+    // g_pollTimer = new QTimer();
+    g_pollTimer = applicationController.pollTimer();
     QObject::connect(g_pollTimer, &QTimer::timeout, &readFullnessAndSend);
     g_pollTimer->start(10000);
 
     // ------------------------------------------------------------
     // 5. Watchdog (кожні 2 секунди)
     // ------------------------------------------------------------
-    g_watchdogTimer = new QTimer();
+    // g_watchdogTimer = new QTimer();
+
+    g_watchdogTimer = applicationController.watchdogTimer();
     QObject::connect(g_watchdogTimer, &QTimer::timeout, &checkWatchdog);
     g_watchdogTimer->start(2000);
 
