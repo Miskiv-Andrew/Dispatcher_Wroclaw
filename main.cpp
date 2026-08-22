@@ -19,7 +19,9 @@
 // ------------------------------------------------------------
 static ModBusClient *g_modbusClient = nullptr;
 static LocalServer *g_localServer = nullptr;
-static QTimer *g_pollTimer = nullptr;
+
+
+// static QTimer *g_pollTimer = nullptr;
 
 
 // ------------------------------------------------------------
@@ -38,21 +40,13 @@ void logMessage(const QString &msg)
     }
 }
 
-// void updateTrayStatus()
-// {
-//     if (!g_trayManager || !g_modbusClient || !g_localServer) return;
-//     bool plcConnected = g_modbusClient->isConnected();
-//     bool hasClient = (g_localServer->clientsCount() > 0);
-//     g_trayManager->updateStatus(plcConnected, hasClient);
-// }
-
 // ------------------------------------------------------------
 // Запис даних цистерни в ПЛК
 // ------------------------------------------------------------
 void writeZBToPLC(int zbNumber, const QJsonObject &data)
 {
     if (!g_modbusClient || !g_modbusClient->isConnected()) {
-        logMessage("[ПОМИЛКА] Немає з'єднання з ПЛК");
+        logMessage("[ERROR] No connection to PLC");
         return;
     }
 
@@ -148,7 +142,7 @@ void writeZBToPLC(int zbNumber, const QJsonObject &data)
         }
     }
 
-    logMessage(QString("[ЗАПИС] Цистерна ZB%1: дані записано").arg(zbNumber));
+    logMessage(QString("[WRITE] Tanker ZB%1: data written").arg(zbNumber));
 }
 
 // ------------------------------------------------------------
@@ -157,7 +151,7 @@ void writeZBToPLC(int zbNumber, const QJsonObject &data)
 void writeCZToPLC(int czNumber, const QJsonObject &data)
 {
     if (!g_modbusClient || !g_modbusClient->isConnected()) {
-        logMessage("[ПОМИЛКА] Немає з'єднання з ПЛК");
+        logMessage("[ERROR] No connection to PLC");
         return;
     }
 
@@ -182,7 +176,7 @@ void writeCZToPLC(int czNumber, const QJsonObject &data)
         g_modbusClient->writeHoldingRegister32Float(basePaed + idx * 2, paed);
     }
 
-    logMessage(QString("[ЗАПИС] Настенний детектор CZ%1: дані записано").arg(czNumber));
+    logMessage(QString("[RECORD] Wall detector CZ%1: data recorded").arg(czNumber));
 }
 
 // ------------------------------------------------------------
@@ -191,7 +185,7 @@ void writeCZToPLC(int czNumber, const QJsonObject &data)
 void replaceDevice(int zbNumber, int newSN)
 {
     if (!g_modbusClient || !g_modbusClient->isConnected()) {
-        logMessage("[ПОМИЛКА] Немає з'єднання з ПЛК");
+        logMessage("[ERROR] No connection to PLC");
         return;
     }
 
@@ -199,54 +193,8 @@ void replaceDevice(int zbNumber, int newSN)
     int idx = zbNumber - 1;
     g_modbusClient->writeHoldingRegister32Int(baseSN + idx * 2, static_cast<quint32>(newSN));
 
-    logMessage(QString("[ЗАМІНА] Цистерна ZB%1: новий SN = %2").arg(zbNumber).arg(newSN));
+    logMessage(QString("[REPLACE] Tank ZB%1: new SN = %2").arg(zbNumber).arg(newSN));
 }
-
-// ------------------------------------------------------------
-// Читання стану баків із ПЛК
-// ------------------------------------------------------------
-void readFullnessAndSend()
-{
-    if (!g_modbusClient || !g_modbusClient->isConnected()) {
-        logMessage("[ПОМИЛКА] Немає з'єднання з ПЛК для читання стану баків");
-        return;
-    }
-
-    QJsonArray zbArray;
-
-    for (int i = 1; i <= 9; ++i) {
-        quint16 address = 10260 + (i - 1);  // тимчасові Coil для тесту
-        bool full = false;
-        if (g_modbusClient->readCoil(address, full)) {
-            QJsonObject zb;
-            zb["number"] = i;
-            zb["fullness"] = full ? 1 : 0;
-            zbArray.append(zb);
-        } else {
-            logMessage(QString("[ПОМИЛКА] Не вдалося прочитати стан бака ZB%1").arg(i));
-        }
-    }
-
-    QJsonObject response;
-    response["type"] = "read";
-    QJsonObject data;
-    data["zb"] = zbArray;
-    response["data"] = data;
-
-    if (g_localServer) {
-        g_localServer->broadcast(response);
-        logMessage("[ЧИТАННЯ] Стан баків прочитано та відправлено");
-    }
-}
-
-
-
-
-
-
-
-
-
 
 
 
@@ -264,35 +212,21 @@ int main(int argc, char *argv[])
 
 
     // ========================================================================
-    // 1. ЛОГИРОВАНИЕ СТАРТА ПРИЛОЖЕНИЯ
+    // 1. ЛОГИРОВАНИЕ СТАРТА
     // ========================================================================
 
     logMessage("[СИСТЕМА] Запуск ModBusBridgeService");
 
 
     // ========================================================================
-    // 2. ЦЕНТРАЛЬНЫЙ КОНТРОЛЛЕР ПРИЛОЖЕНИЯ
-    //
-    // ApplicationController уже является владельцем:
-    //
-    //   - TrayManager;
-    //   - ModBusClient;
-    //   - LocalServer;
-    //   - poll timer;
-    //   - watchdog timer.
-    //
-    // Сам объект находится в стеке main(), поэтому существует всё время
-    // работы event loop и автоматически уничтожается после app.exec().
+    // 2. ЦЕНТРАЛЬНЫЙ КОНТРОЛЛЕР
     // ========================================================================
 
     ApplicationController applicationController;
 
 
     // ------------------------------------------------------------------------
-    // Перед завершением event loop выполняем контролируемый shutdown.
-    //
-    // ApplicationController остановит таймеры, отключит ПЛК и остановит
-    // LocalServer до начала уничтожения QObject.
+    // Контролируемое завершение приложения.
     // ------------------------------------------------------------------------
     QObject::connect(
         &app,
@@ -305,18 +239,8 @@ int main(int argc, char *argv[])
     // ========================================================================
     // 3. MODBUS TCP CLIENT
     //
-    // Сам ModBusClient уже создаётся внутри ApplicationController.
-    //
-    // g_modbusClient пока сохраняем, потому что функции:
-    //
-    //   writeZBToPLC()
-    //   writeCZToPLC()
-    //   replaceDevice()
-    //   readFullnessAndSend()
-    //
-    // всё ещё находятся в main.cpp и используют глобальный указатель.
-    //
-    // Это будет убрано на следующих шагах.
+    // g_modbusClient пока временно остаётся, потому что некоторые
+    // обработчики Python-команд всё ещё находятся в main.cpp.
     // ========================================================================
 
     g_modbusClient = applicationController.modBusClient();
@@ -325,74 +249,82 @@ int main(int argc, char *argv[])
 
 
     // ------------------------------------------------------------------------
-    // Рабочее логирование состояния Modbus.
+    // Логирование состояния соединения с ПЛК.
     // ------------------------------------------------------------------------
     QObject::connect(
         client,
         &ModBusClient::connected,
         []()
         {
-            logMessage("[СИСТЕМА] Підключення до ПЛК встановлено");
+            logMessage("[SYSTEM] Connection to PLC established");
         }
         );
+
 
     QObject::connect(
         client,
         &ModBusClient::disconnected,
         []()
         {
-            logMessage("[СИСТЕМА] Зв'язок з ПЛК втрачено");
+            logMessage("[SYSTEM] Communication with PLC lost");
         }
         );
+
 
     QObject::connect(
         client,
         &ModBusClient::errorOccurred,
         [](const QString &error)
         {
-            logMessage("[ПОМИЛКА] " + error);
+            logMessage("[ERROR] " + error);
         }
         );
+
 
     QObject::connect(
         client,
         &ModBusClient::logMessage,
         [](const QString &msg)
         {
-            logMessage("[ЛОГ] " + msg);
+            logMessage("[LOG] " + msg);
         }
         );
 
 
     // ------------------------------------------------------------------------
-    // Параметры подключения к ПЛК.
+    // Настройки подключения к ПЛК.
     // ------------------------------------------------------------------------
     QString ip = "127.0.0.1";
     quint16 port = 502;
 
+
     if (argc >= 3)
     {
         ip = QString::fromLocal8Bit(argv[1]);
-        port = QString::fromLocal8Bit(argv[2]).toUShort();
+
+        port =
+            QString::fromLocal8Bit(argv[2]).toUShort();
     }
 
 
     client->setConnectionParams(ip, port);
+
     client->setTimeout(2000);
+
     client->setUnitId(1);
+
     client->setWordOrder(true);
 
 
     // ------------------------------------------------------------------------
-    // Запускаем первоначальное подключение.
+    // Первоначальная попытка подключения.
     //
-    // Если ПЛК сейчас недоступен, ModBusClient самостоятельно запустит
-    // механизм reconnect, который мы реализовали ранее.
+    // При неудаче ModBusClient запустит reconnect самостоятельно.
     // ------------------------------------------------------------------------
     if (!client->connectToPLC())
     {
         logMessage(
-            "[СИСТЕМА] Не вдалося ініціювати підключення до ПЛК"
+            "[SYSTEM] Failed to initiate connection to PLC"
             );
     }
 
@@ -400,21 +332,20 @@ int main(int argc, char *argv[])
     // ========================================================================
     // 4. LOCAL SERVER
     //
-    // LocalServer также уже принадлежит ApplicationController.
-    //
-    // g_localServer пока оставляем, потому что readFullnessAndSend()
-    // использует его для broadcast данных Python-клиенту.
+    // g_localServer пока временно остаётся.
     // ========================================================================
 
-    g_localServer = applicationController.localServer();
+    g_localServer =
+        applicationController.localServer();
 
-    LocalServer *server = g_localServer;
+    LocalServer *server =
+        g_localServer;
 
 
     // ------------------------------------------------------------------------
-    // Рабочие команды Python -> PLC.
+    // Python -> PLC.
     //
-    // Эти обработчики пока остаются глобальными функциями main.cpp.
+    // Эти обработчики пока ещё находятся в main.cpp.
     // ------------------------------------------------------------------------
     QObject::connect(
         server,
@@ -422,11 +353,13 @@ int main(int argc, char *argv[])
         &writeZBToPLC
         );
 
+
     QObject::connect(
         server,
         &LocalServer::writeCZ,
         &writeCZToPLC
         );
+
 
     QObject::connect(
         server,
@@ -434,11 +367,19 @@ int main(int argc, char *argv[])
         &replaceDevice
         );
 
+
+    // ------------------------------------------------------------------------
+    // Запрос состояния баков.
+    //
+    // Теперь обработчик находится внутри ApplicationController.
+    // ------------------------------------------------------------------------
     QObject::connect(
         server,
         &LocalServer::requestFullness,
-        &readFullnessAndSend
+        &applicationController,
+        &ApplicationController::readFullnessAndSend
         );
+
 
     QObject::connect(
         server,
@@ -448,26 +389,12 @@ int main(int argc, char *argv[])
 
 
     // ------------------------------------------------------------------------
-    // ВАЖНО:
-    //
-    // Здесь больше НЕТ подключений:
-    //
-    //   writeZB       -> onDataReceived
-    //   writeCZ       -> onDataReceived
-    //   replaceDevice -> onDataReceived
-    //
-    // Контроль активности Python теперь полностью находится
-    // внутри ApplicationController.
-    // ------------------------------------------------------------------------
-
-
-    // ------------------------------------------------------------------------
-    // Запускаем локальный TCP-сервер для Python.
+    // Запуск локального TCP-сервера.
     // ------------------------------------------------------------------------
     if (!server->start(12345))
     {
         logMessage(
-            "[СИСТЕМА] Не вдалося запустити локальний сервер"
+            "[SYSTEM] Failed to start local server"
             );
     }
 
@@ -476,12 +403,6 @@ int main(int argc, char *argv[])
     // 5. SYSTEM TRAY
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // Команда "Выход" из tray завершает QApplication.
-    //
-    // После quit() будет вызван aboutToQuit(), а затем
-    // ApplicationController::shutdown().
-    // ------------------------------------------------------------------------
     QObject::connect(
         applicationController.trayManager(),
         &TrayManager::exitRequested,
@@ -489,56 +410,27 @@ int main(int argc, char *argv[])
         &QCoreApplication::quit
         );
 
-
     // ========================================================================
-    // 6. ПЕРИОДИЧЕСКИЙ ОПРОС ПЛК
-    //
-    // Poll timer уже принадлежит ApplicationController.
-    //
-    // Сам readFullnessAndSend() пока остаётся в main.cpp.
-    // Его перенос выполним отдельно.
+    // 6. EVENT LOOP
     // ========================================================================
 
-    g_pollTimer = applicationController.pollTimer();
-
-    QObject::connect(
-        g_pollTimer,
-        &QTimer::timeout,
-        &readFullnessAndSend
+    logMessage(
+        "[SYSTEM] Starting the event processing loop"
         );
 
-    g_pollTimer->start(10000);
+
+    const int result =
+        app.exec();
 
 
     // ========================================================================
-    // WATCHDOG ЗДЕСЬ БОЛЬШЕ НЕ НАСТРАИВАЕТСЯ.
-    //
-    // Его:
-    //
-    //   - таймер;
-    //   - интервал;
-    //   - timeout;
-    //   - время последней активности Python;
-    //   - запись Coil 9035
-    //
-    // теперь полностью обслуживает ApplicationController.
+    // 7. ЗАВЕРШЕНИЕ
     // ========================================================================
 
+    logMessage(
+        "[SYSTEM] Shutting down"
+        );
 
-    // ========================================================================
-    // 7. ЗАПУСК EVENT LOOP
-    // ========================================================================
-
-    logMessage("[СИСТЕМА] Запуск циклу обробки подій");
-
-    const int result = app.exec();
-
-
-    // ========================================================================
-    // 8. ЗАВЕРШЕНИЕ
-    // ========================================================================
-
-    logMessage("[СИСТЕМА] Завершення роботи");
 
     return result;
 }
