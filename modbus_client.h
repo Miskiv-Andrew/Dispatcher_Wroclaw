@@ -52,10 +52,24 @@ signals:
     void errorOccurred(const QString &errorText);
     void logMessage(const QString &message);
 
+// private slots:
+//     void onSocketConnected();
+//     void onSocketDisconnected();
+//     void onSocketError(QAbstractSocket::SocketError socketError);
+
 private slots:
+    // Вызывается QTcpSocket после успешного подключения к ПЛК.
     void onSocketConnected();
+
+    // Вызывается QTcpSocket после потери соединения.
     void onSocketDisconnected();
+
+    // Обработка сетевых ошибок QTcpSocket.
     void onSocketError(QAbstractSocket::SocketError socketError);
+
+    // Периодическая попытка восстановить соединение с ПЛК.
+    // Слот вызывается таймером reconnect.
+    void tryReconnect();
 
 private:
     // Методи формування запитів (PDU)
@@ -73,6 +87,17 @@ private:
     // Допоміжні методи
     quint16 adjustAddress(quint16 address) const;
 
+    // Запускает таймер автоматического восстановления соединения.
+    //
+    // Метод сам проверяет:
+    //   - разрешён ли автоматический reconnect;
+    //   - не запущен ли таймер уже;
+    //   - действительно ли сокет отключён.
+    //
+    // Благодаря этому несколько одинаковых ошибок сокета
+    // не создадут несколько параллельных попыток подключения.
+    void startReconnectTimer();
+
     QTcpSocket *m_socket;
     QString m_ipAddress;
     quint16 m_port;
@@ -82,6 +107,31 @@ private:
     quint16 m_transactionId;
     bool m_lswFirst;
     int m_addressOffset;   // зсув адреси (за замовчуванням 0)
+
+    // ------------------------------------------------------------------------
+    // Таймер автоматического восстановления соединения с ПЛК.
+    //
+    // Таймер принадлежит ModBusClient и работает в том же потоке,
+    // что и сам ModBusClient/QTcpSocket.
+    // ------------------------------------------------------------------------
+    QTimer *m_reconnectTimer;
+
+    // Интервал между попытками повторного подключения.
+    // Пока используем фиксированные 3 секунды.
+    int m_reconnectIntervalMs;
+
+    // ------------------------------------------------------------------------
+    // Флаг намеренного отключения.
+    //
+    // false:
+    //     потеря соединения считается аварийной и разрешён reconnect.
+    //
+    // true:
+    //     disconnectFromPLC() был вызван намеренно, например при завершении
+    //     приложения, поэтому автоматически подключаться снова нельзя.
+    // ------------------------------------------------------------------------
+    bool m_manualDisconnect;
+
 };
 
 #endif // MODBUS_CLIENT_H

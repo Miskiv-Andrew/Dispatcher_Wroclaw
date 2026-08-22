@@ -347,22 +347,32 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------
     // 3. Створення локального сервера
     // ------------------------------------------------------------
-    LocalServer server;
-    g_localServer = &server;
+
+
+    // ------------------------------------------------------------------------
+    // LocalServer теперь создаётся внутри ApplicationController.
+    //
+    // Глобальный указатель пока сохраняем временно,
+    // потому что существующие функции main.cpp ещё используют g_localServer.
+    // ------------------------------------------------------------------------
+    g_localServer = applicationController.localServer();
+
+    // Временный локальный указатель для минимального изменения main.cpp.
+    LocalServer *server = g_localServer;
 
     // Підключення сигналів сервера до обробників
-    QObject::connect(&server, &LocalServer::writeZB, &writeZBToPLC);
-    QObject::connect(&server, &LocalServer::writeCZ, &writeCZToPLC);
-    QObject::connect(&server, &LocalServer::replaceDevice, &replaceDevice);
-    QObject::connect(&server, &LocalServer::requestFullness, &readFullnessAndSend);
-    QObject::connect(&server, &LocalServer::logMessage, &logMessage);
+    QObject::connect(server, &LocalServer::writeZB, &writeZBToPLC);
+    QObject::connect(server, &LocalServer::writeCZ, &writeCZToPLC);
+    QObject::connect(server, &LocalServer::replaceDevice, &replaceDevice);
+    QObject::connect(server, &LocalServer::requestFullness, &readFullnessAndSend);
+    QObject::connect(server, &LocalServer::logMessage, &logMessage);
 
     // При отриманні будь-яких даних від Python — оновлюємо час
-    QObject::connect(&server, &LocalServer::writeZB, &onDataReceived);
-    QObject::connect(&server, &LocalServer::writeCZ, &onDataReceived);
-    QObject::connect(&server, &LocalServer::replaceDevice, &onDataReceived);
+    QObject::connect(server, &LocalServer::writeZB, &onDataReceived);
+    QObject::connect(server, &LocalServer::writeCZ, &onDataReceived);
+    QObject::connect(server, &LocalServer::replaceDevice, &onDataReceived);
 
-    if (!server.start(12345)) {
+    if (!server->start(12345)) {
         logMessage("[СИСТЕМА] Не вдалося запустити локальний сервер");
     }
 
@@ -389,8 +399,8 @@ int main(int argc, char *argv[])
     QObject::connect(client, &ModBusClient::disconnected, &updateTrayStatus);
 
     // Обновляем статус при изменении количества клиентов
-    QObject::connect(&server, &LocalServer::clientConnected, &updateTrayStatus);
-    QObject::connect(&server, &LocalServer::clientDisconnected, &updateTrayStatus);
+    QObject::connect(server, &LocalServer::clientConnected, &updateTrayStatus);
+    QObject::connect(server, &LocalServer::clientDisconnected, &updateTrayStatus);
 
 
     // Начальное обновление статуса

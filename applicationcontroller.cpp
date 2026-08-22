@@ -6,6 +6,8 @@
 
 #include "modbus_client.h"
 
+#include "localserver.h"
+
 // ============================================================================
 // ApplicationController::ApplicationController
 // ============================================================================
@@ -13,6 +15,7 @@ ApplicationController::ApplicationController(QObject *parent)
     : QObject(parent)
     , m_trayManager(nullptr)
     , m_modBusClient(nullptr)
+    , m_localServer(nullptr)
 {
     // Пока ApplicationController ничего не делает.
     //
@@ -49,6 +52,18 @@ ApplicationController::ApplicationController(QObject *parent)
     m_modBusClient = new ModBusClient(this);
 
     qDebug() << "[APP] ModBusClient created";
+
+    // ------------------------------------------------------------------------
+    // Создаём LocalServer.
+    //
+    // Теперь его жизненный цикл также контролируется ApplicationController.
+    //
+    // На текущем шаге порт, сигналы и обработка данных всё ещё настраиваются
+    // в main.cpp — мы меняем только владение объектом.
+    // ------------------------------------------------------------------------
+    m_localServer = new LocalServer(this);
+
+    qDebug() << "[APP] LocalServer created";
 }
 
 
@@ -80,4 +95,13 @@ TrayManager *ApplicationController::trayManager() const
 ModBusClient *ApplicationController::modBusClient() const
 {
     return m_modBusClient;
+}
+
+
+// ============================================================================
+// ApplicationController::localServer
+// ============================================================================
+LocalServer *ApplicationController::localServer() const
+{
+    return m_localServer;
 }
