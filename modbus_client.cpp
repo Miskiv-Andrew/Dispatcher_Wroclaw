@@ -5,7 +5,9 @@
 #include <QDataStream>
 #include <QThread>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <cstring>
+
 
 ModBusClient::ModBusClient(QObject *parent)
     : QObject(parent)
@@ -20,6 +22,7 @@ ModBusClient::ModBusClient(QObject *parent)
     , m_reconnectTimer(new QTimer(this))
     , m_reconnectIntervalMs(3000)    // Повторяем попытку подключения раз в 3 секунды.
     , m_manualDisconnect(false)      // При обычном запуске автоматическое подключение разрешено.
+    , m_requestInProgress(false)
 {
     connect(m_socket, &QTcpSocket::connected, this, &ModBusClient::onSocketConnected);
     connect(m_socket, &QTcpSocket::disconnected, this, &ModBusClient::onSocketDisconnected);
@@ -486,107 +489,772 @@ QByteArray ModBusClient::buildReadDiscreteInputs(quint16 address, quint16 count)
     return pdu;
 }
 
+
+
+
+
+
+
+
+
 // ------------------------------------------------------------
 // ВІДПРАВКА ТА ОТРИМАННЯ ВІДПОВІДІ
 // ------------------------------------------------------------
-bool ModBusClient::sendRequestAndWaitForResponse(const QByteArray &request, QByteArray &response)
+bool ModBusClient::sendRequestAndWaitForResponse(
+    const QByteArray &request,
+    QByteArray &response
+    )
 {
-    if (!isConnected()) {
-        emit errorOccurred("No connection to PLC");
+    // ========================================================================
+    // 1. VALIDATE REQUEST
+    //
+    // Every Modbus PDU must contain at least the Function Code.
+    // ========================================================================
+
+    if (request.isEmpty())
+    {
+        emit errorOccurred(
+            "Cannot send empty Modbus request"
+            );
+
         return false;
     }
 
-    m_transactionId++;
-    if (m_transactionId == 0) m_transactionId = 1;
+
+    // Save the Function Code belonging to THIS request.
+    const quint8 requestedFunctionCode =
+        static_cast<quint8>(
+            request.at(0)
+            );
+
+
+    // ========================================================================
+    // 2. CHECK CONNECTION
+    // ========================================================================
+
+    if (!isConnected())
+    {
+        emit errorOccurred(
+            "No connection to PLC"
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 3. PROTECT AGAINST OVERLAPPING REQUESTS
+    // ========================================================================
+
+    if (m_requestInProgress)
+    {
+        emit errorOccurred(
+            "Modbus request rejected: another request is already in progress"
+            );
+
+        emit logMessage(
+            "Modbus request skipped because another request is still active"
+            );
+
+        return false;
+    }
+
+
+    m_requestInProgress = true;
+
+
+    // ========================================================================
+    // 4. RAII GUARD
+    //
+    // Guarantees that m_requestInProgress becomes false regardless of
+    // which return path is used below.
+    // ========================================================================
+
+    struct RequestGuard
+    {
+        bool &flag;
+
+        explicit RequestGuard(bool &requestFlag)
+            : flag(requestFlag)
+        {
+        }
+
+        ~RequestGuard()
+        {
+            flag = false;
+        }
+    };
+
+
+    RequestGuard requestGuard(
+        m_requestInProgress
+        );
+
+
+    // ========================================================================
+    // 5. CREATE TRANSACTION ID
+    // ========================================================================
+
+    ++m_transactionId;
+
+
+    if (m_transactionId == 0)
+    {
+        m_transactionId = 1;
+    }
+
+
+    const quint16 currentTransactionId =
+        m_transactionId;
+
+
+    // ========================================================================
+    // 6. BUILD MODBUS TCP FRAME
+    //
+    // MBAP:
+    //
+    //   Transaction ID
+    //   Protocol ID = 0
+    //   Length
+    //   Unit ID
+    //
+    // followed by Modbus PDU.
+    // ========================================================================
 
     QByteArray frame;
-    QDataStream stream(&frame, QIODevice::WriteOnly);
-    stream.setByteOrder(QDataStream::BigEndian);
-    stream << m_transactionId;
+
+
+    QDataStream stream(
+        &frame,
+        QIODevice::WriteOnly
+        );
+
+
+    stream.setByteOrder(
+        QDataStream::BigEndian
+        );
+
+
+    stream << currentTransactionId;
     stream << quint16(0);
     stream << quint16(request.size() + 1);
     stream << m_unitId;
-    frame.append(request);
 
-    qint64 written = m_socket->write(frame);
-    if (written == -1) {
-        emit errorOccurred("Write error");
+
+    frame.append(
+        request
+        );
+
+
+    // ========================================================================
+    // 7. START COMMON REQUEST TIMEOUT
+    // ========================================================================
+
+    QElapsedTimer timer;
+
+    timer.start();
+
+
+    // ========================================================================
+    // 8. WRITE REQUEST
+    // ========================================================================
+
+    const qint64 written =
+        m_socket->write(frame);
+
+
+    if (written < 0)
+    {
+        emit errorOccurred(
+            QString(
+                "Failed to write Modbus request: %1"
+                ).arg(
+                    m_socket->errorString()
+                    )
+            );
+
         return false;
     }
-    if (written != frame.size()) {
-        emit logMessage(QString("Warning: written %1 of %2 bytes").arg(written).arg(frame.size()));
-    }
 
-    emit logMessage(QString("Request sent, transaction %1, %2 bytes").arg(m_transactionId).arg(frame.size()));
 
-    if (!m_socket->waitForReadyRead(m_timeoutMs)) {
-        emit errorOccurred("Timeout waiting for response");
+    if (written != frame.size())
+    {
+        emit errorOccurred(
+            QString(
+                "Incomplete Modbus request write: %1 of %2 bytes"
+                )
+                .arg(written)
+                .arg(frame.size())
+            );
+
         return false;
     }
 
-    if (m_socket->bytesAvailable() < 6) {
-        if (!m_socket->waitForReadyRead(m_timeoutMs) || m_socket->bytesAvailable() < 6) {
-            emit errorOccurred("Incomplete MBAP header");
+
+    // ========================================================================
+    // 9. WAIT UNTIL REQUEST IS PASSED TO THE OPERATING SYSTEM
+    // ========================================================================
+
+    while (m_socket->bytesToWrite() > 0)
+    {
+        const qint64 remainingTime =
+            m_timeoutMs - timer.elapsed();
+
+
+        if (remainingTime <= 0)
+        {
+            emit errorOccurred(
+                "Timeout while sending Modbus request"
+                );
+
+            return false;
+        }
+
+
+        if (!m_socket->waitForBytesWritten(
+                static_cast<int>(remainingTime)
+                ))
+        {
+            emit errorOccurred(
+                QString(
+                    "Failed while sending Modbus request: %1"
+                    ).arg(
+                        m_socket->errorString()
+                        )
+                );
+
             return false;
         }
     }
 
-    QByteArray header = m_socket->read(6);
-    QDataStream headerStream(header);
-    headerStream.setByteOrder(QDataStream::BigEndian);
 
-    quint16 respTransId, respProtocolId, respLength;
-    headerStream >> respTransId >> respProtocolId >> respLength;
+    emit logMessage(
+        QString(
+            "Request sent, transaction %1, function 0x%2, %3 bytes"
+            )
+            .arg(currentTransactionId)
+            .arg(
+                requestedFunctionCode,
+                2,
+                16,
+                QChar('0')
+                )
+            .arg(frame.size())
+        );
 
-    if (respTransId != m_transactionId) {
-        emit errorOccurred("Transaction ID mismatch");
-        return false;
-    }
-    if (respProtocolId != 0) {
-        emit errorOccurred("Invalid Protocol ID");
-        return false;
-    }
-    if (respLength < 1 || respLength > 255) {
-        emit errorOccurred(QString("Invalid response length: %1").arg(respLength));
-        return false;
-    }
 
-    int remaining = respLength;
-    while (m_socket->bytesAvailable() < remaining) {
-        if (!m_socket->waitForReadyRead(m_timeoutMs)) {
-            emit errorOccurred("Timeout reading data");
+    // ========================================================================
+    // 10. WAIT FOR COMPLETE MBAP HEADER
+    // ========================================================================
+
+    constexpr qint64 mbapHeaderSize = 6;
+
+
+    while (m_socket->bytesAvailable() < mbapHeaderSize)
+    {
+        const qint64 remainingTime =
+            m_timeoutMs - timer.elapsed();
+
+
+        if (remainingTime <= 0)
+        {
+            emit errorOccurred(
+                "Timeout waiting for Modbus response header"
+                );
+
+            return false;
+        }
+
+
+        if (!m_socket->waitForReadyRead(
+                static_cast<int>(remainingTime)
+                ))
+        {
+            emit errorOccurred(
+                QString(
+                    "Failed waiting for Modbus response header: %1"
+                    ).arg(
+                        m_socket->errorString()
+                        )
+                );
+
             return false;
         }
     }
 
-    QByteArray raw = m_socket->read(remaining);
-    if (raw.size() < 1) {
-        emit errorOccurred("Not enough data for PDU");
+
+    // ========================================================================
+    // 11. READ MBAP HEADER
+    // ========================================================================
+
+    const QByteArray header =
+        m_socket->read(
+            mbapHeaderSize
+            );
+
+
+    if (header.size() != mbapHeaderSize)
+    {
+        emit errorOccurred(
+            "Incomplete Modbus MBAP header"
+            );
+
         return false;
     }
 
-    quint8 receivedUnitId = static_cast<quint8>(raw[0]);
-    if (receivedUnitId != m_unitId) {
-        emit errorOccurred(QString("Unit ID mismatch: received %1, expected %2").arg(receivedUnitId).arg(m_unitId));
+
+    QDataStream headerStream(
+        header
+        );
+
+
+    headerStream.setByteOrder(
+        QDataStream::BigEndian
+        );
+
+
+    quint16 responseTransactionId = 0;
+    quint16 responseProtocolId = 0;
+    quint16 responseLength = 0;
+
+
+    headerStream
+        >> responseTransactionId
+        >> responseProtocolId
+        >> responseLength;
+
+
+    // ========================================================================
+    // 12. VALIDATE TRANSACTION ID
+    // ========================================================================
+
+    if (responseTransactionId != currentTransactionId)
+    {
+        emit errorOccurred(
+            QString(
+                "Transaction ID mismatch: received %1, expected %2"
+                )
+                .arg(responseTransactionId)
+                .arg(currentTransactionId)
+            );
+
         return false;
     }
 
-    response = raw.mid(1);
-    emit logMessage(QString("Response received, %1 bytes PDU").arg(response.size()));
+
+    // ========================================================================
+    // 13. VALIDATE PROTOCOL ID
+    // ========================================================================
+
+    if (responseProtocolId != 0)
+    {
+        emit errorOccurred(
+            QString(
+                "Invalid Modbus Protocol ID: %1"
+                ).arg(
+                    responseProtocolId
+                    )
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 14. VALIDATE RESPONSE LENGTH
+    //
+    // Length contains:
+    //
+    //   Unit ID + PDU
+    // ========================================================================
+
+    if (responseLength < 2 ||
+        responseLength > 254)
+    {
+        emit errorOccurred(
+            QString(
+                "Invalid Modbus response length: %1"
+                ).arg(
+                    responseLength
+                    )
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 15. WAIT FOR COMPLETE RESPONSE BODY
+    // ========================================================================
+
+    const qint64 expectedBodySize =
+        responseLength;
+
+
+    while (m_socket->bytesAvailable() < expectedBodySize)
+    {
+        const qint64 remainingTime =
+            m_timeoutMs - timer.elapsed();
+
+
+        if (remainingTime <= 0)
+        {
+            emit errorOccurred(
+                "Timeout waiting for complete Modbus response"
+                );
+
+            return false;
+        }
+
+
+        if (!m_socket->waitForReadyRead(
+                static_cast<int>(remainingTime)
+                ))
+        {
+            emit errorOccurred(
+                QString(
+                    "Failed while reading Modbus response: %1"
+                    ).arg(
+                        m_socket->errorString()
+                        )
+                );
+
+            return false;
+        }
+    }
+
+
+    // ========================================================================
+    // 16. READ COMPLETE BODY
+    // ========================================================================
+
+    const QByteArray raw =
+        m_socket->read(
+            expectedBodySize
+            );
+
+
+    if (raw.size() != expectedBodySize)
+    {
+        emit errorOccurred(
+            QString(
+                "Incomplete Modbus response: received %1 of %2 bytes"
+                )
+                .arg(raw.size())
+                .arg(expectedBodySize)
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 17. VALIDATE UNIT ID
+    // ========================================================================
+
+    const quint8 receivedUnitId =
+        static_cast<quint8>(
+            raw.at(0)
+            );
+
+
+    if (receivedUnitId != m_unitId)
+    {
+        emit errorOccurred(
+            QString(
+                "Unit ID mismatch: received %1, expected %2"
+                )
+                .arg(receivedUnitId)
+                .arg(m_unitId)
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 18. EXTRACT PDU
+    // ========================================================================
+
+    response =
+        raw.mid(1);
+
+
+    if (response.isEmpty())
+    {
+        emit errorOccurred(
+            "Empty Modbus PDU received"
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 19. VALIDATE FUNCTION CODE
+    //
+    // A normal response must return exactly the requested Function Code.
+    //
+    // A Modbus Exception Response returns:
+    //
+    //     requestedFunctionCode | 0x80
+    //
+    // Example:
+    //
+    //     request  0x03
+    //     normal   0x03
+    //     exception 0x83
+    //
+    // Any other Function Code means that this response does not correspond
+    // to the Modbus operation we requested.
+    // ========================================================================
+
+    const quint8 receivedFunctionCode =
+        static_cast<quint8>(
+            response.at(0)
+            );
+
+
+    const quint8 expectedExceptionFunctionCode =
+        static_cast<quint8>(
+            requestedFunctionCode | 0x80
+            );
+
+
+    const bool normalResponse =
+        (receivedFunctionCode == requestedFunctionCode);
+
+
+    const bool exceptionResponse =
+        (receivedFunctionCode ==
+         expectedExceptionFunctionCode);
+
+
+    if (!normalResponse &&
+        !exceptionResponse)
+    {
+        emit errorOccurred(
+            QString(
+                "Function Code mismatch: received 0x%1, expected 0x%2"
+                )
+                .arg(
+                    receivedFunctionCode,
+                    2,
+                    16,
+                    QChar('0')
+                    )
+                .arg(
+                    requestedFunctionCode,
+                    2,
+                    16,
+                    QChar('0')
+                    )
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 20. BASIC EXCEPTION RESPONSE VALIDATION
+    //
+    // Exception PDU must contain:
+    //
+    //   Function Code
+    //   Exception Code
+    //
+    // checkException() will interpret the actual exception code later.
+    // ========================================================================
+
+    if (exceptionResponse &&
+        response.size() < 2)
+    {
+        emit errorOccurred(
+            "Incomplete Modbus exception response"
+            );
+
+        return false;
+    }
+
+
+    // ========================================================================
+    // 21. RESPONSE ACCEPTED
+    // ========================================================================
+
+    emit logMessage(
+        QString(
+            "Response received, transaction %1, function 0x%2, %3 bytes PDU"
+            )
+            .arg(currentTransactionId)
+            .arg(
+                receivedFunctionCode,
+                2,
+                16,
+                QChar('0')
+                )
+            .arg(response.size())
+        );
+
+
     return true;
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 bool ModBusClient::checkException(const QByteArray &response)
 {
-    if (response.size() < 2) return false;
-    quint8 functionCode = static_cast<quint8>(response[0]);
-    if ((functionCode & 0x80) != 0) {
-        quint8 exceptionCode = static_cast<quint8>(response[1]);
-        emit errorOccurred(QString("ModBus error: code 0x%1").arg(exceptionCode, 2, 16, QChar('0')));
-        return true;
+    // ========================================================================
+    // 1. BASIC VALIDATION
+    //
+    // A Modbus exception response must contain at least:
+    //
+    //   Function Code
+    //   Exception Code
+    // ========================================================================
+
+    if (response.size() < 2)
+    {
+        return false;
     }
-    return false;
+
+
+    // ========================================================================
+    // 2. READ FUNCTION CODE
+    // ========================================================================
+
+    const quint8 functionCode =
+        static_cast<quint8>(
+            response.at(0)
+            );
+
+
+    // ------------------------------------------------------------------------
+    // Normal Modbus response:
+    //
+    //   bit 7 = 0
+    //
+    // Exception response:
+    //
+    //   bit 7 = 1
+    // ------------------------------------------------------------------------
+    if ((functionCode & 0x80) == 0)
+    {
+        return false;
+    }
+
+
+    // ========================================================================
+    // 3. READ EXCEPTION CODE
+    // ========================================================================
+
+    const quint8 exceptionCode =
+        static_cast<quint8>(
+            response.at(1)
+            );
+
+
+    // ========================================================================
+    // 4. CONVERT EXCEPTION CODE TO HUMAN-READABLE TEXT
+    // ========================================================================
+
+    QString exceptionText;
+
+
+    switch (exceptionCode)
+    {
+    case 0x01:
+        exceptionText = "Illegal Function";
+        break;
+
+    case 0x02:
+        exceptionText = "Illegal Data Address";
+        break;
+
+    case 0x03:
+        exceptionText = "Illegal Data Value";
+        break;
+
+    case 0x04:
+        exceptionText = "Server Device Failure";
+        break;
+
+    case 0x05:
+        exceptionText = "Acknowledge";
+        break;
+
+    case 0x06:
+        exceptionText = "Server Device Busy";
+        break;
+
+    case 0x08:
+        exceptionText = "Memory Parity Error";
+        break;
+
+    case 0x0A:
+        exceptionText = "Gateway Path Unavailable";
+        break;
+
+    case 0x0B:
+        exceptionText = "Gateway Target Device Failed to Respond";
+        break;
+
+    default:
+        exceptionText = "Unknown Modbus Exception";
+        break;
+    }
+
+
+    // ========================================================================
+    // 5. REPORT ERROR
+    // ========================================================================
+
+    const QString errorText =
+        QString(
+            "Modbus Exception 0x%1: %2"
+            )
+            .arg(
+                exceptionCode,
+                2,
+                16,
+                QChar('0')
+                )
+            .arg(
+                exceptionText
+                );
+
+
+    emit errorOccurred(
+        errorText
+        );
+
+
+    emit logMessage(
+        errorText
+        );
+
+
+    return true;
 }
+
+
 
 // ------------------------------------------------------------
 // ДОПОМІЖНІ МЕТОДИ
