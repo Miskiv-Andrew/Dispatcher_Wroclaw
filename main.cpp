@@ -40,13 +40,13 @@ void logMessage(const QString &msg)
     }
 }
 
-void updateTrayStatus()
-{
-    if (!g_trayManager || !g_modbusClient || !g_localServer) return;
-    bool plcConnected = g_modbusClient->isConnected();
-    bool hasClient = (g_localServer->clientsCount() > 0);
-    g_trayManager->updateStatus(plcConnected, hasClient);
-}
+// void updateTrayStatus()
+// {
+//     if (!g_trayManager || !g_modbusClient || !g_localServer) return;
+//     bool plcConnected = g_modbusClient->isConnected();
+//     bool hasClient = (g_localServer->clientsCount() > 0);
+//     g_trayManager->updateStatus(plcConnected, hasClient);
+// }
 
 // ------------------------------------------------------------
 // Запис даних цистерни в ПЛК
@@ -391,34 +391,39 @@ int main(int argc, char *argv[])
     }
 
 
-    // ------------------------------------------------------------------------
-    // TrayManager теперь создаётся и принадлежит ApplicationController.
-    //
-    // Пока сохраняем глобальный указатель, потому что updateTrayStatus()
-    // ещё остаётся глобальной функцией.
-    // Это временное решение на период пошагового рефакторинга.
-    // ------------------------------------------------------------------------
-    g_trayManager = applicationController.trayManager();
+    // // ------------------------------------------------------------------------
+    // // TrayManager теперь создаётся и принадлежит ApplicationController.
+    // //
+    // // Пока сохраняем глобальный указатель, потому что updateTrayStatus()
+    // // ещё остаётся глобальной функцией.
+    // // Это временное решение на период пошагового рефакторинга.
+    // // ------------------------------------------------------------------------
+    // g_trayManager = applicationController.trayManager();
 
-    // Закрытие приложения через пункт меню "Выход"
+    // ------------------------------------------------------------------------
+    // Обработка команды "Выход" из tray.
+    //
+    // TrayManager теперь принадлежит ApplicationController,
+    // поэтому получаем корректный указатель через getter.
+    // ------------------------------------------------------------------------
     QObject::connect(
-        g_trayManager,
+        applicationController.trayManager(),
         &TrayManager::exitRequested,
         &app,
         &QCoreApplication::quit
         );
 
-    // Обновляем статус при изменении состояния подключения к ПЛК
-    QObject::connect(client, &ModBusClient::connected, &updateTrayStatus);
-    QObject::connect(client, &ModBusClient::disconnected, &updateTrayStatus);
+    // // Обновляем статус при изменении состояния подключения к ПЛК
+    // QObject::connect(client, &ModBusClient::connected, &updateTrayStatus);
+    // QObject::connect(client, &ModBusClient::disconnected, &updateTrayStatus);
 
-    // Обновляем статус при изменении количества клиентов
-    QObject::connect(server, &LocalServer::clientConnected, &updateTrayStatus);
-    QObject::connect(server, &LocalServer::clientDisconnected, &updateTrayStatus);
+    // // Обновляем статус при изменении количества клиентов
+    // QObject::connect(server, &LocalServer::clientConnected, &updateTrayStatus);
+    // QObject::connect(server, &LocalServer::clientDisconnected, &updateTrayStatus);
 
 
     // Начальное обновление статуса
-    updateTrayStatus();
+    // updateTrayStatus();
 
 
 
