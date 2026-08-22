@@ -4,12 +4,15 @@
 
 #include "traymanager.h"
 
+#include "modbus_client.h"
+
 // ============================================================================
 // ApplicationController::ApplicationController
 // ============================================================================
 ApplicationController::ApplicationController(QObject *parent)
     : QObject(parent)
     , m_trayManager(nullptr)
+    , m_modBusClient(nullptr)
 {
     // Пока ApplicationController ничего не делает.
     //
@@ -34,6 +37,18 @@ ApplicationController::ApplicationController(QObject *parent)
     m_trayManager = new TrayManager(this);
 
     qDebug() << "[APP] TrayManager created";
+
+
+    // ------------------------------------------------------------------------
+    // Создаём ModBusClient.
+    //
+    // Теперь его жизненный цикл контролируется ApplicationController.
+    // На этом этапе настройки подключения и сама логика соединения
+    // всё ещё остаются в main.cpp.
+    // ------------------------------------------------------------------------
+    m_modBusClient = new ModBusClient(this);
+
+    qDebug() << "[APP] ModBusClient created";
 }
 
 
@@ -57,4 +72,12 @@ ApplicationController::~ApplicationController()
 TrayManager *ApplicationController::trayManager() const
 {
     return m_trayManager;
+}
+
+// ============================================================================
+// ApplicationController::modBusClient
+// ============================================================================
+ModBusClient *ApplicationController::modBusClient() const
+{
+    return m_modBusClient;
 }

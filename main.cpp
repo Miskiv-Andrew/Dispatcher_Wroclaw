@@ -298,20 +298,32 @@ int main(int argc, char *argv[])
     // ------------------------------------------------------------
     // 2. Створення клієнта ModBus
     // ------------------------------------------------------------
-    ModBusClient client;
-    g_modbusClient = &client;
+    // ModBusClient client;
+    // g_modbusClient = &client;
+
+    // ------------------------------------------------------------------------
+    // ModBusClient теперь создаётся внутри ApplicationController.
+    //
+    // Глобальный указатель пока сохраняем временно, потому что существующие
+    // функции main.cpp ещё используют g_modbusClient.
+    // ------------------------------------------------------------------------
+    g_modbusClient = applicationController.modBusClient();
+
+    // Короткий локальный указатель нужен только для того,
+    // чтобы текущий код main.cpp пока менять минимально.
+    ModBusClient *client = g_modbusClient;
 
     // Підключення сигналів клієнта
-    QObject::connect(&client, &ModBusClient::connected, [](){
+    QObject::connect(client, &ModBusClient::connected, [](){
         logMessage("[СИСТЕМА] Підключення до ПЛК встановлено");
     });
-    QObject::connect(&client, &ModBusClient::disconnected, [](){
+    QObject::connect(client, &ModBusClient::disconnected, [](){
         logMessage("[СИСТЕМА] Зв'язок з ПЛК втрачено");
     });
-    QObject::connect(&client, &ModBusClient::errorOccurred, [](const QString &error){
+    QObject::connect(client, &ModBusClient::errorOccurred, [](const QString &error){
         logMessage("[ПОМИЛКА] " + error);
     });
-    QObject::connect(&client, &ModBusClient::logMessage, [](const QString &msg){
+    QObject::connect(client, &ModBusClient::logMessage, [](const QString &msg){
         logMessage("[ЛОГ] " + msg);
     });
 
@@ -323,12 +335,12 @@ int main(int argc, char *argv[])
         port = QString::fromLocal8Bit(argv[2]).toUShort();
     }
 
-    client.setConnectionParams(ip, port);
-    client.setTimeout(2000);
-    client.setUnitId(1);
-    client.setWordOrder(true);
+    client->setConnectionParams(ip, port);
+    client->setTimeout(2000);
+    client->setUnitId(1);
+    client->setWordOrder(true);
 
-    if (!client.connectToPLC()) {
+    if (!client->connectToPLC()) {
         logMessage("[СИСТЕМА] Не вдалося ініціювати підключення до ПЛК");
     }
 
@@ -354,17 +366,6 @@ int main(int argc, char *argv[])
         logMessage("[СИСТЕМА] Не вдалося запустити локальний сервер");
     }
 
-    // // Создаём трей-менеджер
-    // TrayManager trayManager;
-    // g_trayManager = &trayManager;
-
-    // // Закрытие приложения через пункт меню "Выход"
-    // QObject::connect(
-    //     &trayManager,
-    //     &TrayManager::exitRequested,
-    //     &app,
-    //     &QCoreApplication::quit
-    // );
 
     // ------------------------------------------------------------------------
     // TrayManager теперь создаётся и принадлежит ApplicationController.
@@ -384,8 +385,8 @@ int main(int argc, char *argv[])
         );
 
     // Обновляем статус при изменении состояния подключения к ПЛК
-    QObject::connect(&client, &ModBusClient::connected, &updateTrayStatus);
-    QObject::connect(&client, &ModBusClient::disconnected, &updateTrayStatus);
+    QObject::connect(client, &ModBusClient::connected, &updateTrayStatus);
+    QObject::connect(client, &ModBusClient::disconnected, &updateTrayStatus);
 
     // Обновляем статус при изменении количества клиентов
     QObject::connect(&server, &LocalServer::clientConnected, &updateTrayStatus);
