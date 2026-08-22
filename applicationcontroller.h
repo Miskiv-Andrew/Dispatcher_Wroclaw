@@ -3,197 +3,174 @@
 
 #include <QObject>
 #include <QDateTime>
+#include <QJsonObject>
+
 
 class TrayManager;
-
 class ModBusClient;
-
 class LocalServer;
-
 class QTimer;
+
+
 // ============================================================================
 // ApplicationController
 //
-// В будущем этот класс станет центральным управляющим объектом приложения.
+// Central application controller.
 //
-// Его задача:
-//   - владеть основными объектами приложения;
-//   - управлять их временем жизни;
-//   - связывать ModBusClient, LocalServer и TrayManager;
-//   - управлять watchdog и polling;
-//   - хранить и обновлять общее состояние приложения.
+// Responsibilities:
+//   - owns the main application objects;
+//   - controls their lifetime;
+//   - connects LocalServer, ModBusClient and TrayManager;
+//   - handles commands received from Python;
+//   - performs periodic PLC polling;
+//   - monitors Python activity;
+//   - manages controlled application shutdown.
 //
-// На текущем шаге никакая существующая логика сюда НЕ переносится.
-// Мы только создаём архитектурную основу.
+// QObject child ownership is used for all managed QObject instances.
 // ============================================================================
 class ApplicationController : public QObject
 {
     Q_OBJECT
 
+
 public:
 
     // ------------------------------------------------------------------------
-    // Конструктор.
-    //
-    // parent позволяет использовать стандартный механизм владения QObject.
-    // Пока дополнительных объектов внутри ApplicationController нет.
+    // Creates all main application components.
     // ------------------------------------------------------------------------
     explicit ApplicationController(QObject *parent = nullptr);
 
-    // ------------------------------------------------------------------------
-    // Деструктор пока стандартный.
-    //
-    // В дальнейшем ApplicationController будет владеть другими QObject,
-    // и механизм parent-child Qt позволит корректно их уничтожать.
-    // ------------------------------------------------------------------------
     ~ApplicationController() override;
 
+
     // ------------------------------------------------------------------------
-    // Временный доступ к TrayManager.
-    //
-    // Нужен только на период рефакторинга, пока логика обновления tray
-    // ещё находится в main.cpp.
-    //
-    // Позже этот getter, скорее всего, будет удалён.
+    // Access to TrayManager is still required by main.cpp to connect
+    // the tray Exit command to QApplication::quit().
     // ------------------------------------------------------------------------
     TrayManager *trayManager() const;
 
 
     // ------------------------------------------------------------------------
-    // Временный доступ к ModBusClient.
+    // Access to ModBusClient is still required by main.cpp for initial
+    // PLC configuration and operational logging.
     //
-    // Нужен на этапе рефакторинга, пока основная логика работы с ПЛК
-    // остаётся в main.cpp и использует g_modbusClient.
-    //
-    // Позже глобальный указатель будет полностью удалён.
+    // There are no global ModBusClient pointers anymore.
     // ------------------------------------------------------------------------
     ModBusClient *modBusClient() const;
 
 
     // ------------------------------------------------------------------------
-    // Временный доступ к LocalServer.
+    // Access to LocalServer is still required by main.cpp to start the
+    // TCP server and connect operational logging.
     //
-    // Пока часть логики работы с Python-клиентом остаётся в main.cpp,
-    // поэтому нам нужен доступ к объекту через ApplicationController.
-    //
-    // Позже этот getter, скорее всего, будет удалён.
+    // There are no global LocalServer pointers anymore.
     // ------------------------------------------------------------------------
     LocalServer *localServer() const;
 
-    // ------------------------------------------------------------------------
-    // Временный доступ к таймеру периодического опроса.
-    //
-    // Пока сама логика polling остаётся в main.cpp.
-    // Позже getter будет удалён после переноса логики в контроллер.
-    // ------------------------------------------------------------------------
-    QTimer *pollTimer() const;
 
     // ------------------------------------------------------------------------
-    // Временный доступ к watchdog-таймеру.
+    // Performs controlled application shutdown.
     //
-    // Пока функция проверки watchdog остаётся в main.cpp.
-    // ------------------------------------------------------------------------
-    QTimer *watchdogTimer() const;
-
-    // ------------------------------------------------------------------------
-    // Корректное завершение работы приложения.
+    // Shutdown order:
     //
-    // Метод вызывается перед выходом из event loop и останавливает
-    // активные процессы в контролируемом порядке:
+    //   1. stop PLC polling;
+    //   2. stop Python watchdog;
+    //   3. disconnect from PLC;
+    //   4. stop LocalServer.
     //
-    //   1. polling;
-    //   2. watchdog;
-    //   3. соединение с ПЛК;
-    //   4. локальный сервер Python.
-    //
-    // После вызова shutdown() приложение больше не должно пытаться
-    // восстанавливать сетевые соединения.
+    // The method is idempotent.
     // ------------------------------------------------------------------------
     void shutdown();
+
 
 public slots:
 
     // ------------------------------------------------------------------------
-    // Периодически читает состояние заполненности баков из ПЛК
-    // и отправляет результат подключённому Python-клиенту.
+    // Reads tank fullness states from PLC and sends them to Python.
     //
-    // Метод вызывается m_pollTimer.
+    // Called:
+    //   - periodically by m_pollTimer;
+    //   - on explicit requestFullness from Python.
     // ------------------------------------------------------------------------
     void readFullnessAndSend();
 
 
-
 private slots:
 
-    // Обновление состояния системного трея.
+    // ------------------------------------------------------------------------
+    // Updates the two-part system tray indicator.
+    // ------------------------------------------------------------------------
     void updateTrayStatus();
 
+
     // ------------------------------------------------------------------------
-    // Watchdog Python-приложения.
-    //
-    // Периодически проверяет, сколько времени прошло с момента получения
-    // последних данных от Python.
+    // Checks Python application activity and updates watchdog Coil 9035.
     // ------------------------------------------------------------------------
     void checkWatchdog();
 
+
     // ------------------------------------------------------------------------
-    // Вызывается при получении рабочих данных от Python.
-    //
-    // Обновляет время последней активности Python-приложения.
+    // Updates the timestamp of the last working command received from Python.
     // ------------------------------------------------------------------------
     void onPythonDataReceived();
 
 
+    // ------------------------------------------------------------------------
+    // Writes ZB tank data received from Python to PLC.
+    // ------------------------------------------------------------------------
+    void writeZBToPLC(
+        int zbNumber,
+        const QJsonObject &data
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Writes CZ wall detector data received from Python to PLC.
+    // ------------------------------------------------------------------------
+    void writeCZToPLC(
+        int czNumber,
+        const QJsonObject &data
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Replaces the serial number of a ZB device in PLC.
+    // ------------------------------------------------------------------------
+    void replaceDevice(
+        int zbNumber,
+        int newSN
+        );
+
 
 private:
-    // Менеджер иконки системного трея.
-    //
-    // Создаётся внутри ApplicationController и принадлежит ему
-    // через механизм parent-child QObject.
+
+    // System tray manager.
     TrayManager *m_trayManager;
 
-    // ------------------------------------------------------------------------
-    // ModBus TCP клиент.
-    //
-    // ApplicationController становится владельцем объекта.
-    // ModBusClient создаётся с parent = this, поэтому Qt автоматически
-    // уничтожит его вместе с ApplicationController.
-    // ------------------------------------------------------------------------
+
+    // Modbus TCP client used for communication with PLC.
     ModBusClient *m_modBusClient;
 
-    // ------------------------------------------------------------------------
-    // Локальный TCP-сервер для связи с Python-приложением.
-    //
-    // ApplicationController становится владельцем LocalServer.
-    // Объект будет автоматически уничтожен вместе с контроллером.
-    // ------------------------------------------------------------------------
+
+    // Local TCP server used for communication with Python.
     LocalServer *m_localServer;
 
-    // ------------------------------------------------------------------------
-    // Таймер периодического опроса/обмена.
-    //
-    // Владельцем является ApplicationController.
-    // ------------------------------------------------------------------------
+
+    // Periodic PLC polling timer.
     QTimer *m_pollTimer;
 
-    // ------------------------------------------------------------------------
-    // Таймер контроля состояния Python-приложения.
-    //
-    // Владельцем также является ApplicationController.
-    // ------------------------------------------------------------------------
+
+    // Python activity watchdog timer.
     QTimer *m_watchdogTimer;
 
-    // ------------------------------------------------------------------------
-    // Защита от повторного выполнения shutdown().
-    //
-    // aboutToQuit обычно приходит один раз, но для системного компонента
-    // лучше сделать завершение идемпотентным: повторный вызов ничего
-    // дополнительно не закрывает и не запускает.
-    // ------------------------------------------------------------------------
+
+    // Prevents repeated shutdown execution.
     bool m_shuttingDown;
 
-    // Время последнего получения рабочих данных от Python.
+
+    // Time of the last working command received from Python.
     QDateTime m_lastPythonDataTime;
 };
+
 
 #endif // APPLICATIONCONTROLLER_H

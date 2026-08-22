@@ -1,18 +1,13 @@
 #include "applicationcontroller.h"
 
 #include <QDebug>
-
 #include <QTimer>
+#include <QJsonArray>
+#include <QJsonObject>
 
 #include "traymanager.h"
-
 #include "modbus_client.h"
-
 #include "localserver.h"
-
-
-
-
 
 
 // ============================================================================
@@ -32,51 +27,39 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 1. СОЗДАНИЕ ОСНОВНЫХ ОБЪЕКТОВ
+    // 1. CREATE APPLICATION COMPONENTS
+    //
+    // All objects are created before any signal connections are made.
+    // This prevents connect() from receiving nullptr objects.
     // ========================================================================
 
-    // ------------------------------------------------------------------------
-    // Менеджер системного трея.
-    // ------------------------------------------------------------------------
     m_trayManager = new TrayManager(this);
 
     qDebug() << "[APP] TrayManager created";
 
 
-    // ------------------------------------------------------------------------
-    // Modbus TCP клиент для связи с ПЛК.
-    // ------------------------------------------------------------------------
     m_modBusClient = new ModBusClient(this);
 
     qDebug() << "[APP] ModBusClient created";
 
 
-    // ------------------------------------------------------------------------
-    // Локальный TCP-сервер для связи с Python.
-    // ------------------------------------------------------------------------
     m_localServer = new LocalServer(this);
 
     qDebug() << "[APP] LocalServer created";
 
 
-    // ------------------------------------------------------------------------
-    // Таймер периодического чтения состояния баков.
-    // ------------------------------------------------------------------------
     m_pollTimer = new QTimer(this);
 
     qDebug() << "[APP] Poll timer created";
 
 
-    // ------------------------------------------------------------------------
-    // Watchdog-таймер контроля Python-приложения.
-    // ------------------------------------------------------------------------
     m_watchdogTimer = new QTimer(this);
 
     qDebug() << "[APP] Watchdog timer created";
 
 
     // ========================================================================
-    // 2. СОСТОЯНИЕ ПЛК -> TRAY
+    // 2. PLC STATE -> SYSTEM TRAY
     // ========================================================================
 
     connect(
@@ -85,6 +68,7 @@ ApplicationController::ApplicationController(QObject *parent)
         this,
         &ApplicationController::updateTrayStatus
         );
+
 
     connect(
         m_modBusClient,
@@ -95,7 +79,7 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 3. СОСТОЯНИЕ PYTHON -> TRAY
+    // 3. PYTHON CONNECTION STATE -> SYSTEM TRAY
     // ========================================================================
 
     connect(
@@ -104,6 +88,7 @@ ApplicationController::ApplicationController(QObject *parent)
         this,
         &ApplicationController::updateTrayStatus
         );
+
 
     connect(
         m_localServer,
@@ -114,10 +99,55 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 4. КОНТРОЛЬ АКТИВНОСТИ PYTHON
+    // 4. PYTHON COMMANDS -> PLC
     //
-    // Получение рабочей команды от Python означает,
-    // что основное Python-приложение активно.
+    // The complete Python -> PLC command path now belongs to
+    // ApplicationController.
+    //
+    // main.cpp no longer handles these commands.
+    // ========================================================================
+
+    connect(
+        m_localServer,
+        &LocalServer::writeZB,
+        this,
+        &ApplicationController::writeZBToPLC
+        );
+
+
+    connect(
+        m_localServer,
+        &LocalServer::writeCZ,
+        this,
+        &ApplicationController::writeCZToPLC
+        );
+
+
+    connect(
+        m_localServer,
+        &LocalServer::replaceDevice,
+        this,
+        &ApplicationController::replaceDevice
+        );
+
+
+    // ========================================================================
+    // 5. EXPLICIT FULLNESS REQUEST FROM PYTHON
+    // ========================================================================
+
+    connect(
+        m_localServer,
+        &LocalServer::requestFullness,
+        this,
+        &ApplicationController::readFullnessAndSend
+        );
+
+
+    // ========================================================================
+    // 6. PYTHON ACTIVITY MONITORING
+    //
+    // Receiving a working command means that the Python application
+    // is active.
     // ========================================================================
 
     connect(
@@ -127,12 +157,14 @@ ApplicationController::ApplicationController(QObject *parent)
         &ApplicationController::onPythonDataReceived
         );
 
+
     connect(
         m_localServer,
         &LocalServer::writeCZ,
         this,
         &ApplicationController::onPythonDataReceived
         );
+
 
     connect(
         m_localServer,
@@ -143,13 +175,11 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 5. ПЕРИОДИЧЕСКИЙ ОПРОС ПЛК
-    //
-    // Теперь poll timer полностью настраивается здесь.
-    // main.cpp больше не должен знать о нём.
+    // 7. PERIODIC PLC POLLING
     // ========================================================================
 
     m_pollTimer->setInterval(10000);
+
 
     connect(
         m_pollTimer,
@@ -158,14 +188,23 @@ ApplicationController::ApplicationController(QObject *parent)
         &ApplicationController::readFullnessAndSend
         );
 
+
     m_pollTimer->start();
 
 
     // ========================================================================
-    // 6. WATCHDOG PYTHON
+    // 8. PYTHON WATCHDOG
+    //
+    // The check itself runs every 2 seconds.
+    //
+    // NOTE:
+    // The current Python inactivity timeout is intentionally left at
+    // 10 seconds for testing. It can later be changed to the operational
+    // value (for example, 5 minutes).
     // ========================================================================
 
     m_watchdogTimer->setInterval(2000);
+
 
     connect(
         m_watchdogTimer,
@@ -174,206 +213,16 @@ ApplicationController::ApplicationController(QObject *parent)
         &ApplicationController::checkWatchdog
         );
 
+
     m_watchdogTimer->start();
 
 
     // ========================================================================
-    // 7. НАЧАЛЬНОЕ СОСТОЯНИЕ TRAY
+    // 9. INITIAL SYSTEM TRAY STATE
     // ========================================================================
 
     updateTrayStatus();
 }
-
-
-
-
-
-
-
-
-void ApplicationController::onPythonDataReceived()
-{
-    // ------------------------------------------------------------------------
-    // Любая рабочая команда от Python означает, что приложение активно.
-    //
-    // Запоминаем момент получения последних данных.
-    // ------------------------------------------------------------------------
-    m_lastPythonDataTime = QDateTime::currentDateTime();
-}
-
-
-
-
-void ApplicationController::checkWatchdog()
-{
-    // ------------------------------------------------------------------------
-    // Во время завершения приложения watchdog работать не должен.
-    // ------------------------------------------------------------------------
-    if (m_shuttingDown) {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Без соединения с ПЛК записать watchdog Coil невозможно.
-    //
-    // Просто ждём восстановления Modbus-соединения.
-    // ------------------------------------------------------------------------
-    if (!m_modBusClient ||
-        !m_modBusClient->isConnected())
-    {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Определяем, сколько секунд прошло с момента последней рабочей
-    // команды от Python.
-    // ------------------------------------------------------------------------
-    const qint64 secondsSinceLastData =
-        m_lastPythonDataTime.secsTo(
-            QDateTime::currentDateTime()
-            );
-
-
-    // ------------------------------------------------------------------------
-    // Если Python не присылал рабочих данных более 10 секунд,
-    // считаем связь с основным Python-приложением потерянной.
-    // ------------------------------------------------------------------------
-    if (secondsSinceLastData > 10)
-    {
-        m_modBusClient->writeCoil(
-            9035,
-            false
-            );
-
-        qDebug()
-            << "[WATCHDOG] Python activity timeout,"
-            << "Coil 9035 = 0";
-    }
-    else
-    {
-        // Python недавно передавал данные — watchdog считается нормальным.
-        m_modBusClient->writeCoil(
-            9035,
-            true
-            );
-    }
-}
-
-
-
-
-void ApplicationController::readFullnessAndSend()
-{
-    // ------------------------------------------------------------------------
-    // Во время shutdown новые запросы к ПЛК выполнять нельзя.
-    // ------------------------------------------------------------------------
-    if (m_shuttingDown) {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Проверяем наличие объектов.
-    // ------------------------------------------------------------------------
-    if (!m_modBusClient || !m_localServer) {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Если ПЛК сейчас недоступен, просто пропускаем этот цикл опроса.
-    //
-    // ModBusClient самостоятельно занимается восстановлением соединения.
-    // После reconnect следующий timeout таймера продолжит опрос.
-    // ------------------------------------------------------------------------
-    if (!m_modBusClient->isConnected()) {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Массив состояний баков, который будет передан Python.
-    // ------------------------------------------------------------------------
-    QJsonArray zbArray;
-
-
-    // ------------------------------------------------------------------------
-    // Читаем состояния девяти баков.
-    //
-    // Сейчас сохраняем существующую адресацию проекта:
-    //
-    //   ZB1 -> Coil 10260
-    //   ZB2 -> Coil 10261
-    //   ...
-    //   ZB9 -> Coil 10268
-    //
-    // Адреса пока НЕ рефакторим.
-    // Отдельно вынесем их в карту адресов позже.
-    // ------------------------------------------------------------------------
-    for (int i = 1; i <= 9; ++i)
-    {
-        const quint16 address =
-            static_cast<quint16>(10260 + (i - 1));
-
-        bool full = false;
-
-
-        // --------------------------------------------------------------------
-        // Если Coil успешно прочитан — добавляем состояние бака в JSON.
-        // --------------------------------------------------------------------
-        if (m_modBusClient->readCoil(address, full))
-        {
-            QJsonObject zb;
-
-            zb["number"] = i;
-            zb["fullness"] = full ? 1 : 0;
-
-            zbArray.append(zb);
-        }
-        else
-        {
-            // ----------------------------------------------------------------
-            // Ошибка чтения одного бака не должна останавливать весь bridge.
-            //
-            // Записываем ошибку и продолжаем обработку остальных баков.
-            // ----------------------------------------------------------------
-            qWarning()
-                << "[APP] Failed to read fullness state for ZB"
-                << i;
-        }
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Формируем сообщение для Python в существующем формате протокола.
-    // ------------------------------------------------------------------------
-    QJsonObject response;
-
-    response["type"] = "read";
-
-
-    QJsonObject data;
-
-    data["zb"] = zbArray;
-
-
-    response["data"] = data;
-
-
-    // ------------------------------------------------------------------------
-    // Передаём результат всем подключённым Python-клиентам.
-    //
-    // Пока сохраняем существующее поведение через broadcast().
-    // ------------------------------------------------------------------------
-    m_localServer->broadcast(response);
-}
-
-
-
-
-
 
 
 // ============================================================================
@@ -381,11 +230,9 @@ void ApplicationController::readFullnessAndSend()
 // ============================================================================
 ApplicationController::~ApplicationController()
 {
-    // На текущем этапе внутри класса ещё нет принадлежащих ему объектов.
-    //
-    // Позже здесь, скорее всего, вообще не понадобится ручное удаление
-    // QObject-объектов, поскольку они будут иметь ApplicationController
-    // своим parent.
+    // All managed QObject instances have this controller as their parent.
+    // Qt destroys them automatically.
+
     qDebug() << "[APP] ApplicationController destroyed";
 }
 
@@ -397,6 +244,7 @@ TrayManager *ApplicationController::trayManager() const
 {
     return m_trayManager;
 }
+
 
 // ============================================================================
 // ApplicationController::modBusClient
@@ -417,95 +265,700 @@ LocalServer *ApplicationController::localServer() const
 
 
 // ============================================================================
-// ApplicationController::pollTimer
-// ============================================================================
-QTimer *ApplicationController::pollTimer() const
-{
-    return m_pollTimer;
-}
-
-
-// ============================================================================
-// ApplicationController::watchdogTimer
-// ============================================================================
-QTimer *ApplicationController::watchdogTimer() const
-{
-    return m_watchdogTimer;
-}
-
-// ============================================================================
-// ApplicationController::shutdown
+// ApplicationController::writeZBToPLC
 //
-// Выполняет контролируемую остановку рабочих компонентов приложения.
+// Writes tank data received from Python to PLC.
 //
-// ВАЖНО:
-// этот метод вызывается ещё при работающем Qt event loop через aboutToQuit().
-// Поэтому мы не ждём, пока QObject начнут разрушаться сами, а заранее
-// переводим приложение в безопасное остановленное состояние.
+// The PLC register map is intentionally preserved exactly as it existed
+// in main.cpp. Register-map refactoring must be done separately after
+// functional verification.
 // ============================================================================
-void ApplicationController::shutdown()
+void ApplicationController::writeZBToPLC(
+    int zbNumber,
+    const QJsonObject &data
+    )
 {
     // ------------------------------------------------------------------------
-    // Защита от повторного shutdown.
-    //
-    // Если метод уже выполнялся, повторно ничего не делаем.
+    // Do not start new PLC operations during application shutdown.
     // ------------------------------------------------------------------------
     if (m_shuttingDown) {
         return;
     }
 
+
+    // ------------------------------------------------------------------------
+    // PLC must be connected before any write operation.
+    // ------------------------------------------------------------------------
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        qWarning() << "[ERROR] No connection to PLC";
+
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Base addresses for ZB1..ZB9.
+    // ------------------------------------------------------------------------
+    const quint16 baseSN       = 9071;
+    const quint16 baseTemp     = 9089;
+    const quint16 basePaed     = 9107;
+
+    const quint16 baseIso1Name = 9125;
+    const quint16 baseIso1Act  = 9134;
+    const quint16 baseIso1Conc = 9311;
+
+    const quint16 baseIso2Name = 9152;
+    const quint16 baseIso2Act  = 9161;
+    const quint16 baseIso2Conc = 9329;
+
+    const quint16 baseIso3Name = 9179;
+    const quint16 baseIso3Act  = 9188;
+    const quint16 baseIso3Conc = 9347;
+
+
+    // ------------------------------------------------------------------------
+    // Additional isotope addresses used only by ZB3.
+    // ------------------------------------------------------------------------
+    const quint16 iso4Name = 9365;
+    const quint16 iso4Act  = 9367;
+    const quint16 iso4Conc = 9371;
+
+    const quint16 iso5Name = 9366;
+    const quint16 iso5Act  = 9369;
+    const quint16 iso5Conc = 9373;
+
+
+    const int idx = zbNumber - 1;
+
+
+    // ========================================================================
+    // SERIAL NUMBER
+    // ========================================================================
+
+    if (data.contains("sn"))
+    {
+        const quint32 sn =
+            static_cast<quint32>(
+                data.value("sn").toInt()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Int(
+            baseSN + idx * 2,
+            sn
+            );
+    }
+
+
+    // ========================================================================
+    // TEMPERATURE
+    // ========================================================================
+
+    if (data.contains("temperature"))
+    {
+        const float temperature =
+            static_cast<float>(
+                data.value("temperature").toDouble()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Float(
+            baseTemp + idx * 2,
+            temperature
+            );
+    }
+
+
+    // ========================================================================
+    // PAED
+    // ========================================================================
+
+    if (data.contains("paed"))
+    {
+        const float paed =
+            static_cast<float>(
+                data.value("paed").toDouble()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Float(
+            basePaed + idx * 2,
+            paed
+            );
+    }
+
+
+    // ========================================================================
+    // ISOTOPES
+    // ========================================================================
+
+    const QJsonArray isotopes =
+        data.value("isotopes").toArray();
+
+
+    for (const QJsonValue &value : isotopes)
+    {
+        const QJsonObject isotope =
+            value.toObject();
+
+
+        const int id =
+            isotope.value("id").toInt();
+
+
+        const int name =
+            isotope.value("name").toInt();
+
+
+        const float activity =
+            static_cast<float>(
+                isotope.value("activity").toDouble()
+                );
+
+
+        const float concentration =
+            static_cast<float>(
+                isotope.value("concentration").toDouble()
+                );
+
+
+        // --------------------------------------------------------------------
+        // ZB3 supports isotopes 1..5.
+        // --------------------------------------------------------------------
+        if (zbNumber == 3)
+        {
+            if (id == 1)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso1Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso1Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso1Conc + idx * 2,
+                    concentration
+                    );
+            }
+            else if (id == 2)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso2Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso2Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso2Conc + idx * 2,
+                    concentration
+                    );
+            }
+            else if (id == 3)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso3Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso3Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso3Conc + idx * 2,
+                    concentration
+                    );
+            }
+            else if (id == 4)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    iso4Name,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    iso4Act,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    iso4Conc,
+                    concentration
+                    );
+            }
+            else if (id == 5)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    iso5Name,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    iso5Act,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    iso5Conc,
+                    concentration
+                    );
+            }
+        }
+        else
+        {
+            // ----------------------------------------------------------------
+            // All other tanks support isotopes 1..3.
+            // ----------------------------------------------------------------
+
+            if (id == 1)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso1Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso1Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso1Conc + idx * 2,
+                    concentration
+                    );
+            }
+            else if (id == 2)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso2Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso2Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso2Conc + idx * 2,
+                    concentration
+                    );
+            }
+            else if (id == 3)
+            {
+                m_modBusClient->writeHoldingRegister(
+                    baseIso3Name + idx,
+                    name
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso3Act + idx * 2,
+                    activity
+                    );
+
+                m_modBusClient->writeHoldingRegister32Float(
+                    baseIso3Conc + idx * 2,
+                    concentration
+                    );
+            }
+        }
+    }
+
+
+    qDebug()
+        << QString(
+               "[WRITE] Tank ZB%1: data written"
+               ).arg(zbNumber);
+}
+
+
+// ============================================================================
+// ApplicationController::writeCZToPLC
+//
+// Writes wall detector data received from Python to PLC.
+// ============================================================================
+void ApplicationController::writeCZToPLC(
+    int czNumber,
+    const QJsonObject &data
+    )
+{
+    if (m_shuttingDown) {
+        return;
+    }
+
+
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        qWarning() << "[ERROR] No connection to PLC";
+
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Base PLC addresses for CZ devices.
+    // ------------------------------------------------------------------------
+    const quint16 baseSN   = 9281;
+    const quint16 baseTemp = 9287;
+    const quint16 basePaed = 9293;
+
+
+    const int idx =
+        czNumber - 1;
+
+
+    // ========================================================================
+    // SERIAL NUMBER
+    // ========================================================================
+
+    if (data.contains("sn"))
+    {
+        const quint32 sn =
+            static_cast<quint32>(
+                data.value("sn").toInt()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Int(
+            baseSN + idx * 2,
+            sn
+            );
+    }
+
+
+    // ========================================================================
+    // TEMPERATURE
+    // ========================================================================
+
+    if (data.contains("temperature"))
+    {
+        const float temperature =
+            static_cast<float>(
+                data.value("temperature").toDouble()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Float(
+            baseTemp + idx * 2,
+            temperature
+            );
+    }
+
+
+    // ========================================================================
+    // PAED
+    // ========================================================================
+
+    if (data.contains("paed"))
+    {
+        const float paed =
+            static_cast<float>(
+                data.value("paed").toDouble()
+                );
+
+
+        m_modBusClient->writeHoldingRegister32Float(
+            basePaed + idx * 2,
+            paed
+            );
+    }
+
+
+    qDebug()
+        << QString(
+               "[WRITE] Wall detector CZ%1: data written"
+               ).arg(czNumber);
+}
+
+
+// ============================================================================
+// ApplicationController::replaceDevice
+//
+// Writes a new ZB device serial number to PLC.
+// ============================================================================
+void ApplicationController::replaceDevice(
+    int zbNumber,
+    int newSN
+    )
+{
+    if (m_shuttingDown) {
+        return;
+    }
+
+
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        qWarning() << "[ERROR] No connection to PLC";
+
+        return;
+    }
+
+
+    const quint16 baseSN = 9044;
+
+    const int idx =
+        zbNumber - 1;
+
+
+    m_modBusClient->writeHoldingRegister32Int(
+        baseSN + idx * 2,
+        static_cast<quint32>(newSN)
+        );
+
+
+    qDebug()
+        << QString(
+               "[REPLACE] Tank ZB%1: new SN = %2"
+               )
+               .arg(zbNumber)
+               .arg(newSN);
+}
+
+
+// ============================================================================
+// ApplicationController::onPythonDataReceived
+// ============================================================================
+void ApplicationController::onPythonDataReceived()
+{
+    // Any working command received from Python means that the Python
+    // application is active.
+
+    m_lastPythonDataTime =
+        QDateTime::currentDateTime();
+}
+
+
+// ============================================================================
+// ApplicationController::checkWatchdog
+// ============================================================================
+void ApplicationController::checkWatchdog()
+{
+    // ------------------------------------------------------------------------
+    // No watchdog activity is allowed during shutdown.
+    // ------------------------------------------------------------------------
+    if (m_shuttingDown) {
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Watchdog Coil cannot be written while PLC is disconnected.
+    // ------------------------------------------------------------------------
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        return;
+    }
+
+
+    const qint64 secondsSinceLastData =
+        m_lastPythonDataTime.secsTo(
+            QDateTime::currentDateTime()
+            );
+
+
+    // ------------------------------------------------------------------------
+    // TEST VALUE:
+    //
+    // 10 seconds is currently used to make watchdog testing convenient.
+    //
+    // The operational value can later be changed to approximately
+    // five minutes.
+    // ------------------------------------------------------------------------
+    if (secondsSinceLastData > 10)
+    {
+        m_modBusClient->writeCoil(
+            9035,
+            false
+            );
+
+
+        qDebug()
+            << "[WATCHDOG] Python activity timeout,"
+            << "Coil 9035 = 0";
+    }
+    else
+    {
+        m_modBusClient->writeCoil(
+            9035,
+            true
+            );
+    }
+}
+
+
+// ============================================================================
+// ApplicationController::readFullnessAndSend
+//
+// Reads the fullness state of nine ZB tanks and sends the result to Python.
+// ============================================================================
+void ApplicationController::readFullnessAndSend()
+{
+    if (m_shuttingDown) {
+        return;
+    }
+
+
+    if (!m_modBusClient ||
+        !m_localServer)
+    {
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // If PLC is temporarily unavailable, skip this polling cycle.
+    //
+    // ModBusClient is responsible for reconnecting.
+    // ------------------------------------------------------------------------
+    if (!m_modBusClient->isConnected()) {
+        return;
+    }
+
+
+    QJsonArray zbArray;
+
+
+    // ------------------------------------------------------------------------
+    // Existing PLC address map:
+    //
+    //   ZB1 -> Coil 10260
+    //   ...
+    //   ZB9 -> Coil 10268
+    // ------------------------------------------------------------------------
+    for (int i = 1; i <= 9; ++i)
+    {
+        const quint16 address =
+            static_cast<quint16>(
+                10260 + (i - 1)
+                );
+
+
+        bool full = false;
+
+
+        if (m_modBusClient->readCoil(
+                address,
+                full
+                ))
+        {
+            QJsonObject zb;
+
+            zb["number"] = i;
+            zb["fullness"] = full ? 1 : 0;
+
+            zbArray.append(zb);
+        }
+        else
+        {
+            qWarning()
+            << "[APP] Failed to read fullness state for ZB"
+            << i;
+        }
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Preserve the existing Python protocol format.
+    // ------------------------------------------------------------------------
+    QJsonObject response;
+
+    response["type"] = "read";
+
+
+    QJsonObject data;
+
+    data["zb"] = zbArray;
+
+
+    response["data"] = data;
+
+
+    m_localServer->broadcast(response);
+}
+
+
+// ============================================================================
+// ApplicationController::shutdown
+//
+// Performs controlled shutdown while the Qt event loop is still alive.
+// ============================================================================
+void ApplicationController::shutdown()
+{
+    // ------------------------------------------------------------------------
+    // Protect against repeated shutdown calls.
+    // ------------------------------------------------------------------------
+    if (m_shuttingDown) {
+        return;
+    }
+
+
     m_shuttingDown = true;
+
 
     qDebug() << "[APP] Shutdown started";
 
 
-    // ------------------------------------------------------------------------
-    // 1. Останавливаем периодический polling.
-    //
-    // После начала shutdown новые операции с ПЛК запускаться не должны.
-    // ------------------------------------------------------------------------
-    if (m_pollTimer && m_pollTimer->isActive()) {
+    // ========================================================================
+    // 1. STOP PERIODIC PLC POLLING
+    // ========================================================================
+
+    if (m_pollTimer &&
+        m_pollTimer->isActive())
+    {
         m_pollTimer->stop();
 
         qDebug() << "[APP] Poll timer stopped";
     }
 
 
-    // ------------------------------------------------------------------------
-    // 2. Останавливаем watchdog.
-    //
-    // Во время завершения приложения больше не нужно контролировать
-    // состояние Python-клиента.
-    // ------------------------------------------------------------------------
-    if (m_watchdogTimer && m_watchdogTimer->isActive()) {
+    // ========================================================================
+    // 2. STOP PYTHON WATCHDOG
+    // ========================================================================
+
+    if (m_watchdogTimer &&
+        m_watchdogTimer->isActive())
+    {
         m_watchdogTimer->stop();
 
         qDebug() << "[APP] Watchdog timer stopped";
     }
 
 
-    // ------------------------------------------------------------------------
-    // 3. Намеренно отключаемся от ПЛК.
+    // ========================================================================
+    // 3. DISCONNECT FROM PLC
     //
-    // disconnectFromPLC() теперь устанавливает m_manualDisconnect = true
-    // внутри ModBusClient и останавливает его reconnect timer.
-    //
-    // Поэтому после этой точки ModBusClient НЕ должен пытаться
-    // подключиться к ПЛК повторно.
-    // ------------------------------------------------------------------------
-    if (m_modBusClient) {
+    // disconnectFromPLC() performs intentional disconnect and prevents
+    // the reconnect mechanism from starting again.
+    // ========================================================================
+
+    if (m_modBusClient)
+    {
         m_modBusClient->disconnectFromPLC();
 
         qDebug() << "[APP] PLC disconnected";
     }
 
 
-    // ------------------------------------------------------------------------
-    // 4. Останавливаем локальный TCP-сервер.
-    //
-    // После этого новые Python-клиенты подключаться уже не смогут.
-    // ------------------------------------------------------------------------
-    if (m_localServer) {
+    // ========================================================================
+    // 4. STOP LOCAL PYTHON SERVER
+    // ========================================================================
+
+    if (m_localServer)
+    {
         m_localServer->stop();
 
         qDebug() << "[APP] LocalServer stopped";
@@ -518,25 +971,9 @@ void ApplicationController::shutdown()
 
 // ============================================================================
 // ApplicationController::updateTrayStatus
-//
-// Централизованно формирует состояние tray-индикатора.
-//
-// ApplicationController является единственным местом,
-// которое знает одновременно о:
-//   - ModBusClient;
-//   - LocalServer;
-//   - TrayManager.
-//
-// Поэтому глобальная функция updateTrayStatus() в main.cpp
-// больше не требуется.
 // ============================================================================
-
 void ApplicationController::updateTrayStatus()
 {
-    // ------------------------------------------------------------------------
-    // Защита от вызова в момент, когда один из компонентов ещё не создан
-    // или уже находится в процессе завершения.
-    // ------------------------------------------------------------------------
     if (!m_trayManager ||
         !m_modBusClient ||
         !m_localServer)
@@ -546,32 +983,23 @@ void ApplicationController::updateTrayStatus()
 
 
     // ------------------------------------------------------------------------
-    // Левая половина tray-индикатора:
-    // состояние соединения с ПЛК.
+    // Left half:
+    // PLC connection state.
     // ------------------------------------------------------------------------
     const bool plcConnected =
         m_modBusClient->isConnected();
 
 
     // ------------------------------------------------------------------------
-    // Правая половина tray-индикатора:
-    // наличие подключённого Python-клиента.
+    // Right half:
+    // Python TCP connection state.
     //
-    // Пока считаем Python подключённым, если LocalServer видит
-    // хотя бы одного активного клиента.
-    //
-    // Позже, когда добавим heartbeat/watchdog-состояние,
-    // здесь будет учитываться уже не только TCP-соединение,
-    // но и фактическое состояние Python-приложения.
+    // This is intentionally independent from watchdog activity.
     // ------------------------------------------------------------------------
     const bool pythonConnected =
         (m_localServer->clientsCount() > 0);
 
 
-    // ------------------------------------------------------------------------
-    // TrayManager ничего не вычисляет сам.
-    // Он только отображает переданные ему состояния.
-    // ------------------------------------------------------------------------
     m_trayManager->updateStatus(
         plcConnected,
         pythonConnected
