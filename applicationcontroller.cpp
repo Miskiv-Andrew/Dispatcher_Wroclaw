@@ -2,11 +2,14 @@
 
 #include <QDebug>
 
+#include "traymanager.h"
+
 // ============================================================================
 // ApplicationController::ApplicationController
 // ============================================================================
 ApplicationController::ApplicationController(QObject *parent)
     : QObject(parent)
+    , m_trayManager(nullptr)
 {
     // Пока ApplicationController ничего не делает.
     //
@@ -21,6 +24,16 @@ ApplicationController::ApplicationController(QObject *parent)
     // Сейчас важно только убедиться, что новый класс корректно
     // подключён к проекту и не влияет на существующее поведение.
     qDebug() << "[APP] ApplicationController created";
+
+    // ------------------------------------------------------------------------
+    // Создаём TrayManager.
+    //
+    // Передаём this как parent, поэтому TrayManager принадлежит
+    // ApplicationController и будет автоматически уничтожен вместе с ним.
+    // ------------------------------------------------------------------------
+    m_trayManager = new TrayManager(this);
+
+    qDebug() << "[APP] TrayManager created";
 }
 
 
@@ -35,4 +48,13 @@ ApplicationController::~ApplicationController()
     // QObject-объектов, поскольку они будут иметь ApplicationController
     // своим parent.
     qDebug() << "[APP] ApplicationController destroyed";
+}
+
+
+// ============================================================================
+// ApplicationController::trayManager
+// ============================================================================
+TrayManager *ApplicationController::trayManager() const
+{
+    return m_trayManager;
 }

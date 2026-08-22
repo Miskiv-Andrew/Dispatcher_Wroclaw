@@ -354,19 +354,34 @@ int main(int argc, char *argv[])
         logMessage("[СИСТЕМА] Не вдалося запустити локальний сервер");
     }
 
-    // Создаём трей-менеджер
-    TrayManager trayManager;
-    g_trayManager = &trayManager;
+    // // Создаём трей-менеджер
+    // TrayManager trayManager;
+    // g_trayManager = &trayManager;
+
+    // // Закрытие приложения через пункт меню "Выход"
+    // QObject::connect(
+    //     &trayManager,
+    //     &TrayManager::exitRequested,
+    //     &app,
+    //     &QCoreApplication::quit
+    // );
+
+    // ------------------------------------------------------------------------
+    // TrayManager теперь создаётся и принадлежит ApplicationController.
+    //
+    // Пока сохраняем глобальный указатель, потому что updateTrayStatus()
+    // ещё остаётся глобальной функцией.
+    // Это временное решение на период пошагового рефакторинга.
+    // ------------------------------------------------------------------------
+    g_trayManager = applicationController.trayManager();
 
     // Закрытие приложения через пункт меню "Выход"
     QObject::connect(
-        &trayManager,
+        g_trayManager,
         &TrayManager::exitRequested,
         &app,
         &QCoreApplication::quit
-    );
-
-    QObject::connect(&trayManager, &TrayManager::exitRequested, &app, &QCoreApplication::quit);
+        );
 
     // Обновляем статус при изменении состояния подключения к ПЛК
     QObject::connect(&client, &ModBusClient::connected, &updateTrayStatus);
