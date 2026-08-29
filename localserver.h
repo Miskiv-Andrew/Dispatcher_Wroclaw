@@ -7,17 +7,24 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
-#include <QTimer>
+#include <QHash>
 
 /**
- * @brief Клас локального TCP-сервера для прийому JSON-команд від Python
+ * @brief Local TCP server for receiving JSON commands from Python.
  *
- * Відповідає за:
- * - прийом підключень від Python-клієнтів
- * - читання JSON-повідомлень
- * - парсинг команд (write, read, replacement)
- * - виклик відповідних методів ModBusClient
- * - відправку відповідей (read)
+ * Responsibilities:
+ * - accepts connections from Python clients;
+ * - receives JSON messages;
+ * - buffers TCP data until a complete JSON message is received;
+ * - parses commands (write, read, replacement);
+ * - emits signals for further processing by ApplicationController;
+ * - sends JSON responses back to connected Python clients.
+ *
+ * TCP message format:
+ *
+ *     JSON + '\n'
+ *
+ * The newline character is used as the message delimiter.
  */
 class LocalServer : public QObject
 {
@@ -28,77 +35,121 @@ public:
     ~LocalServer();
 
     /**
-     * @brief Запускає TCP-сервер на вказаному порту
-     * @param port Порт для прослуховування
-     * @return true, якщо сервер успішно запущено
+     * @brief Starts the local TCP server.
+     * @param port TCP port to listen on.
+     * @return true if the server was started successfully.
      */
     bool start(quint16 port = 12345);
 
     /**
-     * @brief Зупиняє сервер та закриває всі з'єднання
+     * @brief Stops the server and closes all client connections.
      */
     void stop();
 
     /**
-     * @brief Відправляє JSON-повідомлення всім підключеним клієнтам
-     * @param json JSON-об'єкт для відправки
+     * @brief Sends a JSON message to all connected clients.
+     * @param json JSON object to send.
      */
     void broadcast(const QJsonObject &json);
 
-    int clientsCount() const { return m_clients.size(); }
+    /**
+     * @brief Returns the number of currently connected clients.
+     */
+    int clientsCount() const
+    {
+        return m_clients.size();
+    }
 
 signals:
+
     /**
-     * @brief Сигнал для запису даних цистерни в ПЛК
-     * @param zbNumber Номер цистерни (1..9)
-     * @param data JSON-об'єкт з даними
+     * @brief Requests writing ZB data to PLC.
+     * @param zbNumber ZB number (1..9).
+     * @param data JSON object containing ZB data.
      */
     void writeZB(int zbNumber, const QJsonObject &data);
 
     /**
-     * @brief Сигнал для запису даних настенного детектора в ПЛК
-     * @param czNumber Номер детектора (1..3)
-     * @param data JSON-об'єкт з даними
+     * @brief Requests writing CZ data to PLC.
+     * @param czNumber CZ number (1..3).
+     * @param data JSON object containing CZ data.
      */
     void writeCZ(int czNumber, const QJsonObject &data);
 
     /**
-     * @brief Сигнал для заміни приладу
-     * @param zbNumber Номер цистерни
-     * @param newSN Новий серійний номер
+     * @brief Requests device replacement.
+     * @param zbNumber ZB number.
+     * @param newSN New serial number.
      */
     void replaceDevice(int zbNumber, int newSN);
 
     /**
-     * @brief Сигнал для запиту стану баків
+     * @brief Requests current tank fullness states.
      */
     void requestFullness();
 
     /**
-     * @brief Сигнал для логування
+     * @brief Sends LocalServer log messages.
      */
     void logMessage(const QString &msg);
 
+    /**
+     * @brief Emitted when a Python client connects.
+     */
     void clientConnected();
+
+    /**
+     * @brief Emitted when a Python client disconnects.
+     */
     void clientDisconnected();
 
-
 private slots:
+
+    /**
+     * @brief Handles new TCP connections.
+     */
     void onNewConnection();
+
+    /**
+     * @brief Handles client disconnection.
+     */
     void onClientDisconnected();
+
+    /**
+     * @brief Receives and buffers TCP data from a client.
+     */
     void onClientReadyRead();
 
 private:
-    /**
-     * @brief Обробляє отриманий JSON-пакет
-     * @param json JSON-об'єкт
-     */
-    void processJson(const QJsonObject &json, QTcpSocket *client);
 
-    QTcpServer *m_server;               ///< TCP-сервер
-    QList<QTcpSocket*> m_clients;       ///< Список підключених клієнтів
-    quint16 m_port;                     ///< Порт сервера
-    bool m_running;                     ///< Стан сервера
+    /**
+     * @brief Processes one complete JSON message.
+     * @param json Parsed JSON object.
+     */
+    void processJson(const QJsonObject &json);
+    QTcpServer *m_server;
+
+    /**
+     * @brief List of currently connected Python clients.
+     */
+    QList<QTcpSocket*> m_clients;
+
+    /**
+     * @brief Individual receive buffer for each connected client.
+     *
+     * TCP is a byte stream and does not preserve message boundaries.
+     * Therefore one readyRead() call may contain:
+     *
+     * - only part of one JSON message;
+     * - exactly one JSON message;
+     * - several JSON messages.
+     *
+     * Each client therefore requires its own accumulation buffer.
+     */
+    QHash<QTcpSocket*, QByteArray> m_receiveBuffers;
+
+    quint16 m_port;
+    bool m_running;
 };
 
 #endif // LOCALSERVER_H
