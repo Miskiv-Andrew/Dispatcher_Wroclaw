@@ -98,22 +98,126 @@ void LocalServer::stop()
 
 void LocalServer::broadcast(const QJsonObject &json)
 {
-    if (m_clients.isEmpty()) {
-        emit logMessage("No connected clients to send");
+    // ------------------------------------------------------------------------
+    // 1. There is nothing to send if no Python clients are connected.
+    // ------------------------------------------------------------------------
+    if (m_clients.isEmpty())
+    {
+        emit logMessage(
+            "No connected clients to send"
+            );
+
         return;
     }
 
-    QJsonDocument doc(json);
-    QByteArray data = doc.toJson(QJsonDocument::Compact) + "\n";
+    // ------------------------------------------------------------------------
+    // 2. Serialize the JSON object using the protocol format:
+    //
+    //        JSON + '\n'
+    //
+    // The newline is required because Python uses it as the message
+    // delimiter when reading the TCP byte stream.
+    // ------------------------------------------------------------------------
+    QByteArray data =
+        QJsonDocument(json).toJson(
+            QJsonDocument::Compact
+            );
 
-    for (QTcpSocket *client : m_clients) {
-        if (client->state() == QTcpSocket::ConnectedState) {
-            client->write(data);
+    data.append('\n');
+
+    // ------------------------------------------------------------------------
+    // 3. Send the complete message to every currently connected client.
+    // ------------------------------------------------------------------------
+    for (QTcpSocket *client : m_clients)
+    {
+        if (!client)
+        {
+            continue;
+        }
+
+        // --------------------------------------------------------------------
+        // A socket can still temporarily exist in m_clients while its
+        // disconnected signal is waiting to be processed.
+        //
+        // Do not attempt to write to such a socket.
+        // --------------------------------------------------------------------
+        if (client->state() != QAbstractSocket::ConnectedState)
+        {
+            emit logMessage(
+                "Skipping client: socket is not connected"
+                );
+
+            continue;
+        }
+
+        qint64 totalWritten = 0;
+
+        // --------------------------------------------------------------------
+        // QTcpSocket::write() normally queues the complete QByteArray, but the
+        // return value must still be checked.
+        //
+        // Keep writing until the complete protocol frame has been accepted
+        // by the socket's outgoing buffer.
+        // --------------------------------------------------------------------
+        while (totalWritten < data.size())
+        {
+            const qint64 written =
+                client->write(
+                    data.constData() + totalWritten,
+                    data.size() - totalWritten
+                    );
+
+            // ----------------------------------------------------------------
+            // A negative value means that QTcpSocket rejected the write.
+            // Zero means that no progress was made, so continuing this loop
+            // could result in an infinite loop.
+            // ----------------------------------------------------------------
+            if (written <= 0)
+            {
+                emit logMessage(
+                    QString(
+                        "Failed to send data to client %1:%2: %3"
+                        )
+                        .arg(client->peerAddress().toString())
+                        .arg(client->peerPort())
+                        .arg(client->errorString())
+                    );
+
+                // ------------------------------------------------------------
+                // The current JSON frame could not be queued completely.
+                //
+                // Close this connection so that Python cannot continue using
+                // a TCP stream containing an incomplete protocol message.
+                // onClientDisconnected() will perform the normal cleanup.
+                // ------------------------------------------------------------
+                client->abort();
+
+                break;
+            }
+
+            totalWritten += written;
+        }
+
+        // --------------------------------------------------------------------
+        // Log success only if the complete JSON frame was accepted by the
+        // socket.
+        // --------------------------------------------------------------------
+        if (totalWritten == data.size())
+        {
+            emit logMessage(
+                QString(
+                    "Broadcast sent to client %1:%2, %3 bytes"
+                    )
+                    .arg(client->peerAddress().toString())
+                    .arg(client->peerPort())
+                    .arg(totalWritten)
+                );
         }
     }
-
-    emit logMessage("Broadcast sent to all clients");
 }
+
+
+
 
 // ------------------------------------------------------------
 // СЛОТИ ДЛЯ РОБОТИ З КЛІЄНТАМИ
@@ -209,7 +313,6 @@ void LocalServer::onClientReadyRead()
         return;
     }
 
-    // Read all bytes that are currently available from the TCP socket.
     const QByteArray receivedData = client->readAll();
 
     if (receivedData.isEmpty())
@@ -222,43 +325,105 @@ void LocalServer::onClientReadyRead()
             .arg(receivedData.size())
         );
 
-    // Get the individual receive buffer associated with this client.
+    // ------------------------------------------------------------------------
+    // Maximum allowed size of one incoming JSON message.
     //
-    // The reference is important: all new bytes are appended directly
-    // to the buffer stored inside m_receiveBuffers.
+    // The protocol uses newline-delimited JSON:
+    //
+    //     JSON + '\n'
+    //
+    // Therefore, if the receive buffer grows beyond this limit without
+    // receiving a newline, the client is most likely sending malformed data
+    // or is stuck in an invalid transmission state.
+    //
+    // 64 KiB is significantly larger than the expected normal JSON packets
+    // used by this application.
+    // ------------------------------------------------------------------------
+    constexpr qsizetype MAX_MESSAGE_SIZE = 64 * 1024;
+
     QByteArray &buffer = m_receiveBuffers[client];
 
-    // Append newly received TCP data to data that may have remained
-    // from a previous readyRead() call.
     buffer.append(receivedData);
 
-    // One JSON message in our protocol is terminated by '\n'.
-    //
-    // There may already be several complete messages in the buffer,
-    // therefore continue processing until no complete line remains.
     while (true)
     {
-        const qsizetype newlinePosition = buffer.indexOf('\n');
+        const qsizetype newlinePosition =
+            buffer.indexOf('\n');
 
-        // No '\n' means that the last JSON message is still incomplete.
-        //
-        // Leave it in the buffer. The next readyRead() call will append
-        // more bytes and processing will continue from there.
+        // --------------------------------------------------------------------
+        // No complete JSON message is available yet.
+        // --------------------------------------------------------------------
         if (newlinePosition < 0)
         {
+            // ----------------------------------------------------------------
+            // Protect the application from an endlessly growing buffer.
+            //
+            // If more than MAX_MESSAGE_SIZE bytes have arrived without a
+            // newline delimiter, this cannot be accepted as a valid protocol
+            // message.
+            // ----------------------------------------------------------------
+            if (buffer.size() > MAX_MESSAGE_SIZE)
+            {
+                emit logMessage(
+                    QString(
+                        "Client disconnected: incoming message exceeds %1 bytes"
+                        )
+                        .arg(MAX_MESSAGE_SIZE)
+                    );
+
+                // ------------------------------------------------------------
+                // Clear the buffered malformed data before closing the socket.
+                // ------------------------------------------------------------
+                buffer.clear();
+
+                // ------------------------------------------------------------
+                // Close the connection immediately.
+                //
+                // onClientDisconnected() will remove the client from
+                // m_clients and m_receiveBuffers.
+                // ------------------------------------------------------------
+                client->abort();
+
+                return;
+            }
+
+            // ----------------------------------------------------------------
+            // The current JSON message is incomplete but still within the
+            // allowed size. Keep it in the buffer and wait for more data.
+            // ----------------------------------------------------------------
             break;
         }
 
-        // Extract exactly one complete message.
-        QByteArray message = buffer.left(newlinePosition);
+        // --------------------------------------------------------------------
+        // A newline was found, but the JSON frame itself is too large.
+        // --------------------------------------------------------------------
+        if (newlinePosition > MAX_MESSAGE_SIZE)
+        {
+            emit logMessage(
+                QString(
+                    "Client disconnected: incoming message exceeds %1 bytes"
+                    )
+                    .arg(MAX_MESSAGE_SIZE)
+                );
 
-        // Remove the processed message together with its '\n' delimiter.
+            buffer.clear();
+
+            client->abort();
+
+            return;
+        }
+
+        // --------------------------------------------------------------------
+        // Extract one complete newline-delimited JSON message.
+        // --------------------------------------------------------------------
+        QByteArray message =
+            buffer.left(newlinePosition);
+
         buffer.remove(
             0,
             newlinePosition + 1
             );
 
-        // Ignore empty lines.
         message = message.trimmed();
 
         if (message.isEmpty())
@@ -266,7 +431,9 @@ void LocalServer::onClientReadyRead()
             continue;
         }
 
-        // Parse one complete JSON message.
+        // --------------------------------------------------------------------
+        // Parse JSON.
+        // --------------------------------------------------------------------
         QJsonParseError parseError;
 
         const QJsonDocument document =
@@ -282,12 +449,12 @@ void LocalServer::onClientReadyRead()
                     .arg(parseError.errorString())
                 );
 
-            // This message is invalid, but it must not prevent
-            // processing of the following messages already present
-            // in the TCP buffer.
             continue;
         }
 
+        // --------------------------------------------------------------------
+        // The top-level protocol message must always be a JSON object.
+        // --------------------------------------------------------------------
         if (!document.isObject())
         {
             emit logMessage(
@@ -297,10 +464,25 @@ void LocalServer::onClientReadyRead()
             continue;
         }
 
-        // Pass one valid and complete JSON object for command processing.
-        processJson(document.object());
+        processJson(
+            document.object()
+            );
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ------------------------------------------------------------
