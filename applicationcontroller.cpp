@@ -10,6 +10,7 @@
 #include "localserver.h"
 
 
+
 // ============================================================================
 // ApplicationController::ApplicationController
 // ============================================================================
@@ -22,6 +23,8 @@ ApplicationController::ApplicationController(QObject *parent)
     , m_watchdogTimer(nullptr)
     , m_shuttingDown(false)
     , m_lastPythonDataTime(QDateTime::currentDateTime())
+    , m_watchdogStateKnown(false)
+    , m_lastWatchdogState(false)
 {
     qDebug() << "[APP] ApplicationController created";
 
@@ -79,7 +82,46 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 3. PYTHON CONNECTION STATE -> SYSTEM TRAY
+    // 3. PLC CONNECTION STATE -> WATCHDOG SYNCHRONIZATION
+    //
+    // The watchdog state stored in ApplicationController is only a cache of
+    // the last value successfully written to PLC.
+    //
+    // After PLC disconnect/reconnect we cannot assume that Coil 9035 still
+    // contains the previously written value. The PLC may have restarted or
+    // its internal state may have changed.
+    //
+    // Therefore the cached watchdog state is marked as unknown whenever the
+    // PLC connection changes.
+    //
+    // On the next watchdog timer cycle checkWatchdog() will write the current
+    // required state to Coil 9035 again.
+    // ========================================================================
+
+    connect(
+        m_modBusClient,
+        &ModBusClient::connected,
+        this,
+        [this]()
+        {
+            m_watchdogStateKnown = false;
+        }
+        );
+
+
+    connect(
+        m_modBusClient,
+        &ModBusClient::disconnected,
+        this,
+        [this]()
+        {
+            m_watchdogStateKnown = false;
+        }
+        );
+
+
+    // ========================================================================
+    // 4. PYTHON CONNECTION STATE -> SYSTEM TRAY
     // ========================================================================
 
     connect(
@@ -99,12 +141,12 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 4. PYTHON COMMANDS -> PLC
+    // 5. PYTHON COMMANDS -> PLC
     //
-    // The complete Python -> PLC command path now belongs to
+    // The complete Python -> PLC command path belongs to
     // ApplicationController.
     //
-    // main.cpp no longer handles these commands.
+    // main.cpp does not handle these commands.
     // ========================================================================
 
     connect(
@@ -132,7 +174,7 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 5. EXPLICIT FULLNESS REQUEST FROM PYTHON
+    // 6. EXPLICIT FULLNESS REQUEST FROM PYTHON
     // ========================================================================
 
     connect(
@@ -144,10 +186,14 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 6. PYTHON ACTIVITY MONITORING
+    // 7. PYTHON ACTIVITY MONITORING
     //
-    // Receiving a working command means that the Python application
-    // is active.
+    // Receiving a working command means that the Python application is
+    // active.
+    //
+    // onPythonDataReceived() updates m_lastPythonDataTime.
+    // checkWatchdog() later uses this timestamp to determine whether Python
+    // is still active.
     // ========================================================================
 
     connect(
@@ -175,10 +221,16 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 7. PERIODIC PLC POLLING
+    // 8. PERIODIC PLC POLLING
+    //
+    // Fullness states of ZB tanks are read every 20 seconds.
+    //
+    // The physical process is very slow, so more frequent polling would
+    // generate unnecessary Modbus traffic without providing useful
+    // additional information.
     // ========================================================================
 
-    m_pollTimer->setInterval(10000);
+    m_pollTimer->setInterval(20000);
 
 
     connect(
@@ -193,17 +245,28 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 8. PYTHON WATCHDOG
+    // 9. PYTHON WATCHDOG
     //
-    // The check itself runs every 2 seconds.
+    // The watchdog CHECK runs every 10 seconds.
     //
-    // NOTE:
-    // The current Python inactivity timeout is intentionally left at
-    // 10 seconds for testing. It can later be changed to the operational
-    // value (for example, 5 minutes).
+    // This timer does not define the Python inactivity timeout itself.
+    // It only determines how often checkWatchdog() checks Python activity.
+    //
+    // The inactivity timeout inside checkWatchdog() is:
+    //
+    //     300000 ms = 5 minutes
+    //
+    // Coil 9035 is written only when:
+    //
+    //     - watchdog state changes ON -> OFF;
+    //     - watchdog state changes OFF -> ON;
+    //     - PLC reconnects and the cached state becomes unknown.
+    //
+    // Therefore the timer can run every 10 seconds without generating a
+    // Modbus write every 10 seconds.
     // ========================================================================
 
-    m_watchdogTimer->setInterval(2000);
+    m_watchdogTimer->setInterval(10000);
 
 
     connect(
@@ -218,7 +281,7 @@ ApplicationController::ApplicationController(QObject *parent)
 
 
     // ========================================================================
-    // 9. INITIAL SYSTEM TRAY STATE
+    // 10. INITIAL SYSTEM TRAY STATE
     // ========================================================================
 
     updateTrayStatus();
@@ -743,61 +806,150 @@ void ApplicationController::onPythonDataReceived()
 
 // ============================================================================
 // ApplicationController::checkWatchdog
+//
+// Checks Python activity and controls PLC watchdog Coil 9035.
+//
+// The method is called every 10 seconds by m_watchdogTimer.
+//
+// Python is considered inactive if no working command has been received
+// for more than 5 minutes.
+//
+// IMPORTANT:
+// Coil 9035 is NOT written on every watchdog timer cycle.
+// A Modbus write is performed only when:
+//     1. the watchdog state changes;
+//     2. the watchdog state is unknown, for example after PLC reconnect.
 // ============================================================================
 void ApplicationController::checkWatchdog()
 {
     // ------------------------------------------------------------------------
-    // No watchdog activity is allowed during shutdown.
+    // No watchdog activity is allowed during application shutdown.
     // ------------------------------------------------------------------------
-    if (m_shuttingDown) {
-        return;
-    }
-
-
-    // ------------------------------------------------------------------------
-    // Watchdog Coil cannot be written while PLC is disconnected.
-    // ------------------------------------------------------------------------
-    if (!m_modBusClient ||
-        !m_modBusClient->isConnected())
+    if (m_shuttingDown)
     {
         return;
     }
 
 
-    const qint64 secondsSinceLastData =
-        m_lastPythonDataTime.secsTo(
+    // ------------------------------------------------------------------------
+    // The watchdog Coil cannot be written while PLC is disconnected.
+    //
+    // In this case the cached state is marked as unknown.
+    // After PLC reconnect the next watchdog check will force synchronization
+    // of Coil 9035 with the current Python activity state.
+    // ------------------------------------------------------------------------
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        m_watchdogStateKnown = false;
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Operational Python inactivity timeout:
+    //
+    //     300000 ms = 300 seconds = 5 minutes.
+    // ------------------------------------------------------------------------
+    constexpr qint64 WATCHDOG_TIMEOUT_MS = 300000;
+
+
+    // ------------------------------------------------------------------------
+    // Calculate how long Python has been inactive.
+    // ------------------------------------------------------------------------
+    const qint64 millisecondsSinceLastData =
+        m_lastPythonDataTime.msecsTo(
             QDateTime::currentDateTime()
             );
 
 
     // ------------------------------------------------------------------------
-    // TEST VALUE:
+    // Required watchdog state:
     //
-    // 10 seconds is currently used to make watchdog testing convenient.
-    //
-    // The operational value can later be changed to approximately
-    // five minutes.
+    //     true  -> Python is active  -> Coil 9035 = ON
+    //     false -> Python timeout    -> Coil 9035 = OFF
     // ------------------------------------------------------------------------
-    if (secondsSinceLastData > 10)
+    const bool requiredWatchdogState =
+        millisecondsSinceLastData <= WATCHDOG_TIMEOUT_MS;
+
+
+    // ------------------------------------------------------------------------
+    // If the required state is already known to be written to PLC,
+    // there is nothing to do.
+    //
+    // m_watchdogTimer will continue checking Python activity every
+    // 10 seconds, but no unnecessary Modbus request will be generated.
+    // ------------------------------------------------------------------------
+    if (m_watchdogStateKnown &&
+        m_lastWatchdogState == requiredWatchdogState)
     {
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // The watchdog state has changed, or its current PLC state is unknown.
+    //
+    // Write the required value to Coil 9035.
+    // ------------------------------------------------------------------------
+    const bool writeSuccessful =
         m_modBusClient->writeCoil(
             9035,
-            false
+            requiredWatchdogState
             );
 
 
+    // ------------------------------------------------------------------------
+    // If the Modbus write failed, do not update the cached state.
+    //
+    // This allows the next watchdog cycle to try again.
+    // ------------------------------------------------------------------------
+    if (!writeSuccessful)
+    {
+        m_watchdogStateKnown = false;
+
+        qWarning()
+            << "[WATCHDOG] Failed to update Coil 9035";
+
+        return;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // The value was successfully written to PLC.
+    //
+    // Remember it so that identical values are not written repeatedly.
+    // ------------------------------------------------------------------------
+    m_lastWatchdogState = requiredWatchdogState;
+    m_watchdogStateKnown = true;
+
+
+    // ------------------------------------------------------------------------
+    // Log only actual watchdog state changes/synchronizations.
+    // ------------------------------------------------------------------------
+    if (requiredWatchdogState)
+    {
         qDebug()
-            << "[WATCHDOG] Python activity timeout,"
-            << "Coil 9035 = 0";
+        << "[WATCHDOG] Python active, Coil 9035 = 1";
     }
     else
     {
-        m_modBusClient->writeCoil(
-            9035,
-            true
-            );
+        qDebug()
+        << "[WATCHDOG] Python activity timeout, Coil 9035 = 0";
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ============================================================================
@@ -889,6 +1041,23 @@ void ApplicationController::readFullnessAndSend()
 
     m_localServer->broadcast(response);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ============================================================================

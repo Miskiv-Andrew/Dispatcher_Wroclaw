@@ -170,6 +170,28 @@ private:
 
     // Time of the last working command received from Python.
     QDateTime m_lastPythonDataTime;
+
+
+    // ------------------------------------------------------------------------
+    // Cached state of the Python watchdog coil in PLC.
+    //
+    // m_watchdogStateKnown:
+    //     false - we do not know whether PLC currently contains the required
+    //             watchdog value. In this case the next watchdog check must
+    //             write the value to PLC.
+    //
+    // m_lastWatchdogState:
+    //     last successfully written state:
+    //         true  -> Python is active
+    //         false -> Python activity timeout
+    //
+    // This prevents writing the same value to Coil 9035 every time the
+    // watchdog timer fires.
+    // ------------------------------------------------------------------------
+    bool m_watchdogStateKnown;
+    bool m_lastWatchdogState;
+
+
 };
 
 

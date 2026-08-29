@@ -98,6 +98,30 @@ private:
     // не создадут несколько параллельных попыток подключения.
     void startReconnectTimer();
 
+    // ------------------------------------------------------------------------
+    // Removes unread bytes left in the socket from a previous failed or
+    // timed-out Modbus transaction.
+    //
+    // With synchronous request/response communication there must not be
+    // stale data in the socket before a new request is sent.
+    // ------------------------------------------------------------------------
+    void clearStaleInputBuffer();
+
+
+    // ------------------------------------------------------------------------
+    // Handles a transport-level communication failure.
+    //
+    // Used for:
+    //   - socket disconnect during a request;
+    //   - timeout while sending;
+    //   - timeout while waiting for a response;
+    //   - low-level socket read/write errors.
+    //
+    // The method resets the connection and starts reconnect unless the
+    // disconnect was intentionally requested.
+    // ------------------------------------------------------------------------
+    void handleCommunicationFailure(const QString &errorText);
+
     QTcpSocket *m_socket;
     QString m_ipAddress;
     quint16 m_port;

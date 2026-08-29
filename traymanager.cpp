@@ -244,17 +244,17 @@ void TrayManager::updateStatus(bool connectedToPLC, bool hasClient)
     QString plcStatus;
 
     if (connectedToPLC)
-        plcStatus = "подключен";
+        plcStatus = "connected";
     else
-        plcStatus = "нет подключения";
+        plcStatus = "no connection";
 
 
     QString pythonStatus;
 
     if (hasClient)
-        pythonStatus = "подключен";
+        pythonStatus = "connected";
     else
-        pythonStatus = "нет подключения";
+        pythonStatus = "no connectionя";
 
 
     // ---------------------------------------------------------

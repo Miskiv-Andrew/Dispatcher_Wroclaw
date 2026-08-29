@@ -20,19 +20,19 @@ LocalServer::~LocalServer()
 bool LocalServer::start(quint16 port)
 {
     if (m_running) {
-        emit logMessage("Сервер вже запущено");
+        emit logMessage("Server is already running.");
         return true;
     }
 
     m_port = port;
     if (!m_server->listen(QHostAddress::LocalHost, m_port)) {
-        emit logMessage(QString("Не вдалося запустити сервер на порту %1: %2")
+        emit logMessage(QString("Failed to start server on port %1: %2")
                             .arg(m_port).arg(m_server->errorString()));
         return false;
     }
 
     m_running = true;
-    emit logMessage(QString("Сервер запущено на порту %1").arg(m_port));
+    emit logMessage(QString("Server is running on port %1").arg(m_port));
     return true;
 }
 
@@ -49,13 +49,13 @@ void LocalServer::stop()
 
     m_server->close();
     m_running = false;
-    emit logMessage("Сервер зупинено");
+    emit logMessage("Server stopped");
 }
 
 void LocalServer::broadcast(const QJsonObject &json)
 {
     if (m_clients.isEmpty()) {
-        emit logMessage("Немає підключених клієнтів для відправки");
+        emit logMessage("No connected clients to send");
         return;
     }
 
@@ -68,7 +68,7 @@ void LocalServer::broadcast(const QJsonObject &json)
         }
     }
 
-    emit logMessage("Відправлено broadcast всім клієнтам");
+    emit logMessage("Broadcast sent to all clients");
 }
 
 // ------------------------------------------------------------
@@ -84,7 +84,7 @@ void LocalServer::onNewConnection()
         connect(client, &QTcpSocket::disconnected, this, &LocalServer::onClientDisconnected);
         connect(client, &QTcpSocket::readyRead, this, &LocalServer::onClientReadyRead);
 
-        emit logMessage(QString("Підключено клієнт: %1:%2")
+        emit logMessage(QString("Client connected: %1:%2")
                             .arg(client->peerAddress().toString())
                             .arg(client->peerPort()));
 
@@ -104,7 +104,7 @@ void LocalServer::onClientDisconnected()
     client->disconnectFromHost();
     client->deleteLater();
 
-    emit logMessage("Клієнт відключено");
+    emit logMessage("Client disconnected");
 
     emit clientDisconnected();
 }
@@ -116,7 +116,7 @@ void LocalServer::onClientReadyRead()
     if (!client) return;
 
     QByteArray data = client->readAll();
-    emit logMessage(QString("Отримано %1 байт").arg(data.size()));
+    emit logMessage(QString("Received %1 байт").arg(data.size()));
 
     // Парсимо JSON
     QJsonParseError parseError;
@@ -127,7 +127,7 @@ void LocalServer::onClientReadyRead()
     }
 
     if (!doc.isObject()) {
-        emit logMessage("Отримано не JSON-об'єкт");
+        emit logMessage("Received no JSON-object");
         return;
     }
 
@@ -183,6 +183,6 @@ void LocalServer::processJson(const QJsonObject &json, QTcpSocket *client)
         emit requestFullness();
 
     } else {
-        emit logMessage(QString("Невідомий тип команди: %1").arg(type));
+        emit logMessage(QString("Unknown command type: %1").arg(type));
     }
 }
