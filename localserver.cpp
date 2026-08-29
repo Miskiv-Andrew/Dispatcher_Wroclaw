@@ -1,6 +1,7 @@
 #include "localserver.h"
 #include <QDebug>
 #include <QJsonParseError>
+#include <cmath>
 
 LocalServer::LocalServer(QObject *parent)
     : QObject(parent)
@@ -307,76 +308,343 @@ void LocalServer::onClientReadyRead()
 // ------------------------------------------------------------
 void LocalServer::processJson(const QJsonObject &json)
 {
-    QString type = json.value("type").toString();
+    // ------------------------------------------------------------
+    // 1. Validate command type.
+    // ------------------------------------------------------------
+    const QJsonValue typeValue = json.value("type");
 
-    if (type == "write")
-    {
-        QJsonObject data = json.value("data").toObject();
-
-        // Process ZB data.
-        QJsonArray zbArray = data.value("zb").toArray();
-
-        for (const QJsonValue &val : zbArray)
-        {
-            QJsonObject zb = val.toObject();
-            int number = zb.value("number").toInt();
-
-            if (number >= 1 && number <= 9)
-            {
-                emit writeZB(number, zb);
-            }
-        }
-
-        // Process CZ data.
-        QJsonArray czArray = data.value("cz").toArray();
-
-        for (const QJsonValue &val : czArray)
-        {
-            QJsonObject cz = val.toObject();
-            int number = cz.value("number").toInt();
-
-            if (number >= 1 && number <= 3)
-            {
-                emit writeCZ(number, cz);
-            }
-        }
-
-        // Process device replacement.
-        if (data.contains("replacement"))
-        {
-            QJsonObject replacement =
-                data.value("replacement").toObject();
-
-            int zbNumber =
-                replacement.value("zb_number").toInt();
-
-            int newSN =
-                replacement.value("new_sn").toInt();
-
-            if (zbNumber >= 1 &&
-                zbNumber <= 9 &&
-                newSN > 0)
-            {
-                emit replaceDevice(
-                    zbNumber,
-                    newSN
-                    );
-            }
-        }
-
-        // Request current tank states after writing data.
-        emit requestFullness();
-    }
-    else if (type == "read")
-    {
-        // Request current tank states.
-        emit requestFullness();
-    }
-    else
+    if (!typeValue.isString())
     {
         emit logMessage(
-            QString("Unknown command type: %1")
-                .arg(type)
+            "Invalid JSON command: missing or invalid 'type'"
             );
+
+        return;
     }
+
+    const QString type = typeValue.toString();
+
+    if (type.isEmpty())
+    {
+        emit logMessage(
+            "Invalid JSON command: 'type' is empty"
+            );
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 2. WRITE command.
+    // ------------------------------------------------------------
+    if (type == "write")
+    {
+        const QJsonValue dataValue = json.value("data");
+
+        if (!dataValue.isObject())
+        {
+            emit logMessage(
+                "Invalid write command: missing or invalid 'data' object"
+                );
+
+            return;
+        }
+
+        const QJsonObject data = dataValue.toObject();
+
+        bool containsSupportedData = false;
+
+        // --------------------------------------------------------
+        // 2.1. Process ZB data.
+        // --------------------------------------------------------
+        if (data.contains("zb"))
+        {
+            containsSupportedData = true;
+
+            const QJsonValue zbValue = data.value("zb");
+
+            if (!zbValue.isArray())
+            {
+                emit logMessage(
+                    "Invalid write command: 'zb' must be an array"
+                    );
+            }
+            else
+            {
+                const QJsonArray zbArray = zbValue.toArray();
+
+                for (const QJsonValue &value : zbArray)
+                {
+                    if (!value.isObject())
+                    {
+                        emit logMessage(
+                            "Invalid ZB entry: expected JSON object"
+                            );
+
+                        continue;
+                    }
+
+                    const QJsonObject zb = value.toObject();
+
+                    const QJsonValue numberValue =
+                        zb.value("number");
+
+                    if (!numberValue.isDouble())
+                    {
+                        emit logMessage(
+                            "Invalid ZB entry: missing or invalid 'number'"
+                            );
+
+                        continue;
+                    }
+
+                    const double rawNumber =
+                        numberValue.toDouble();
+
+                    // A tank number must be an integer.
+                    //
+                    // Values such as 2.5 must not silently become 2.
+                    if (std::floor(rawNumber) != rawNumber)
+                    {
+                        emit logMessage(
+                            "Invalid ZB entry: 'number' must be an integer"
+                            );
+
+                        continue;
+                    }
+
+                    const int number =
+                        static_cast<int>(rawNumber);
+
+                    if (number < 1 || number > 9)
+                    {
+                        emit logMessage(
+                            QString(
+                                "Invalid ZB number: %1, expected range 1..9"
+                                )
+                                .arg(number)
+                            );
+
+                        continue;
+                    }
+
+                    emit writeZB(
+                        number,
+                        zb
+                        );
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // 2.2. Process CZ data.
+        // --------------------------------------------------------
+        if (data.contains("cz"))
+        {
+            containsSupportedData = true;
+
+            const QJsonValue czValue = data.value("cz");
+
+            if (!czValue.isArray())
+            {
+                emit logMessage(
+                    "Invalid write command: 'cz' must be an array"
+                    );
+            }
+            else
+            {
+                const QJsonArray czArray = czValue.toArray();
+
+                for (const QJsonValue &value : czArray)
+                {
+                    if (!value.isObject())
+                    {
+                        emit logMessage(
+                            "Invalid CZ entry: expected JSON object"
+                            );
+
+                        continue;
+                    }
+
+                    const QJsonObject cz = value.toObject();
+
+                    const QJsonValue numberValue =
+                        cz.value("number");
+
+                    if (!numberValue.isDouble())
+                    {
+                        emit logMessage(
+                            "Invalid CZ entry: missing or invalid 'number'"
+                            );
+
+                        continue;
+                    }
+
+                    const double rawNumber =
+                        numberValue.toDouble();
+
+                    // A detector number must be an integer.
+                    if (std::floor(rawNumber) != rawNumber)
+                    {
+                        emit logMessage(
+                            "Invalid CZ entry: 'number' must be an integer"
+                            );
+
+                        continue;
+                    }
+
+                    const int number =
+                        static_cast<int>(rawNumber);
+
+                    if (number < 1 || number > 3)
+                    {
+                        emit logMessage(
+                            QString(
+                                "Invalid CZ number: %1, expected range 1..3"
+                                )
+                                .arg(number)
+                            );
+
+                        continue;
+                    }
+
+                    emit writeCZ(
+                        number,
+                        cz
+                        );
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // 2.3. Process device replacement.
+        // --------------------------------------------------------
+        if (data.contains("replacement"))
+        {
+            containsSupportedData = true;
+
+            const QJsonValue replacementValue =
+                data.value("replacement");
+
+            if (!replacementValue.isObject())
+            {
+                emit logMessage(
+                    "Invalid write command: 'replacement' must be an object"
+                    );
+            }
+            else
+            {
+                const QJsonObject replacement =
+                    replacementValue.toObject();
+
+                const QJsonValue zbNumberValue =
+                    replacement.value("zb_number");
+
+                const QJsonValue newSnValue =
+                    replacement.value("new_sn");
+
+                if (!zbNumberValue.isDouble())
+                {
+                    emit logMessage(
+                        "Invalid replacement: missing or invalid 'zb_number'"
+                        );
+                }
+                else if (!newSnValue.isDouble())
+                {
+                    emit logMessage(
+                        "Invalid replacement: missing or invalid 'new_sn'"
+                        );
+                }
+                else
+                {
+                    const double rawZbNumber =
+                        zbNumberValue.toDouble();
+
+                    const double rawNewSn =
+                        newSnValue.toDouble();
+
+                    if (std::floor(rawZbNumber) != rawZbNumber)
+                    {
+                        emit logMessage(
+                            "Invalid replacement: 'zb_number' must be an integer"
+                            );
+                    }
+                    else if (std::floor(rawNewSn) != rawNewSn)
+                    {
+                        emit logMessage(
+                            "Invalid replacement: 'new_sn' must be an integer"
+                            );
+                    }
+                    else
+                    {
+                        const int zbNumber =
+                            static_cast<int>(rawZbNumber);
+
+                        const int newSN =
+                            static_cast<int>(rawNewSn);
+
+                        if (zbNumber < 1 || zbNumber > 9)
+                        {
+                            emit logMessage(
+                                QString(
+                                    "Invalid replacement ZB number: %1, expected range 1..9"
+                                    )
+                                    .arg(zbNumber)
+                                );
+                        }
+                        else if (newSN <= 0)
+                        {
+                            emit logMessage(
+                                QString(
+                                    "Invalid replacement serial number: %1"
+                                    )
+                                    .arg(newSN)
+                                );
+                        }
+                        else
+                        {
+                            emit replaceDevice(
+                                zbNumber,
+                                newSN
+                                );
+                        }
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // 2.4. Reject an empty/unsupported write command.
+        // --------------------------------------------------------
+        if (!containsSupportedData)
+        {
+            emit logMessage(
+                "Invalid write command: no supported data sections found"
+                );
+
+            return;
+        }
+
+        // Request current tank states after processing a write command.
+        emit requestFullness();
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 3. READ command.
+    // ------------------------------------------------------------
+    if (type == "read")
+    {
+        emit requestFullness();
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // 4. Unknown command.
+    // ------------------------------------------------------------
+    emit logMessage(
+        QString("Unknown command type: %1")
+            .arg(type)
+        );
 }
