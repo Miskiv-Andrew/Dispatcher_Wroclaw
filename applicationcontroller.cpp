@@ -87,15 +87,25 @@ ApplicationController::ApplicationController(QObject *parent)
     // The watchdog state stored in ApplicationController is only a cache of
     // the last value successfully written to PLC.
     //
-    // After PLC disconnect/reconnect we cannot assume that Coil 9035 still
-    // contains the previously written value. The PLC may have restarted or
-    // its internal state may have changed.
+    // According to the current PLC register map, watchdog state is stored in
+    // one 16-bit Holding Register:
+    //
+    //     Holding Register 9035
+    //
+    // Values:
+    //
+    //     0 = Python application is inactive
+    //     1 = Python application is active
+    //
+    // After PLC disconnect/reconnect we cannot assume that Holding Register
+    // 9035 still contains the previously written value. The PLC may have
+    // restarted or its internal state may have changed.
     //
     // Therefore the cached watchdog state is marked as unknown whenever the
     // PLC connection changes.
     //
     // On the next watchdog timer cycle checkWatchdog() will write the current
-    // required state to Coil 9035 again.
+    // required state to Holding Register 9035 again.
     // ========================================================================
 
     connect(
@@ -256,10 +266,15 @@ ApplicationController::ApplicationController(QObject *parent)
     //
     //     300000 ms = 5 minutes
     //
-    // Coil 9035 is written only when:
+    // Watchdog state is stored in Holding Register 9035 as int16:
     //
-    //     - watchdog state changes ON -> OFF;
-    //     - watchdog state changes OFF -> ON;
+    //     0 = Python application is inactive
+    //     1 = Python application is active
+    //
+    // Holding Register 9035 is written only when:
+    //
+    //     - watchdog state changes 1 -> 0;
+    //     - watchdog state changes 0 -> 1;
     //     - PLC reconnects and the cached state becomes unknown.
     //
     // Therefore the timer can run every 10 seconds without generating a
@@ -327,14 +342,40 @@ LocalServer *ApplicationController::localServer() const
 }
 
 
+
 // ============================================================================
 // ApplicationController::writeZBToPLC
 //
-// Writes tank data received from Python to PLC.
+// Writes ZB tank data received from Python to PLC.
 //
-// The PLC register map is intentionally preserved exactly as it existed
-// in main.cpp. Register-map refactoring must be done separately after
-// functional verification.
+// The method handles:
+//
+//     - device serial number;
+//     - temperature;
+//     - PAED;
+//     - isotope identification;
+//     - isotope activity;
+//     - isotope concentration;
+//     - high-sensitivity channel state;
+//     - low-sensitivity channel state;
+//     - measurement validity;
+//     - device connection state;
+//     - ready-to-drain state.
+//
+// Logical PLC parameters are stored as one 16-bit Holding Register each.
+//
+// The Bridge does not invert logical values received from Python.
+// Values are written exactly according to the PLC register map:
+//
+//     0 -> logical state 0
+//     1 -> logical state 1
+//
+// Only values 0 and 1 are accepted for logical registers.
+// Invalid logical values are ignored and reported in the application log.
+//
+// ModBusClient applies the configured address offset internally, therefore
+// all addresses in this method are logical addresses from the PLC register
+// table.
 // ============================================================================
 void ApplicationController::writeZBToPLC(
     int zbNumber,
@@ -344,7 +385,8 @@ void ApplicationController::writeZBToPLC(
     // ------------------------------------------------------------------------
     // Do not start new PLC operations during application shutdown.
     // ------------------------------------------------------------------------
-    if (m_shuttingDown) {
+    if (m_shuttingDown)
+    {
         return;
     }
 
@@ -355,30 +397,64 @@ void ApplicationController::writeZBToPLC(
     if (!m_modBusClient ||
         !m_modBusClient->isConnected())
     {
-        qWarning() << "[ERROR] No connection to PLC";
+        qWarning()
+        << "[ERROR] No connection to PLC";
 
         return;
     }
 
 
+    // ========================================================================
+    // 1. PLC REGISTER MAP
+    // ========================================================================
+
     // ------------------------------------------------------------------------
-    // Base addresses for ZB1..ZB9.
+    // Main ZB parameters.
     // ------------------------------------------------------------------------
     const quint16 baseSN       = 9071;
     const quint16 baseTemp     = 9089;
     const quint16 basePaed     = 9107;
 
+
+    // ------------------------------------------------------------------------
+    // Isotope 1.
+    // ------------------------------------------------------------------------
     const quint16 baseIso1Name = 9125;
     const quint16 baseIso1Act  = 9134;
     const quint16 baseIso1Conc = 9311;
 
+
+    // ------------------------------------------------------------------------
+    // Isotope 2.
+    // ------------------------------------------------------------------------
     const quint16 baseIso2Name = 9152;
     const quint16 baseIso2Act  = 9161;
     const quint16 baseIso2Conc = 9329;
 
+
+    // ------------------------------------------------------------------------
+    // Isotope 3.
+    // ------------------------------------------------------------------------
     const quint16 baseIso3Name = 9179;
     const quint16 baseIso3Act  = 9188;
     const quint16 baseIso3Conc = 9347;
+
+
+    // ------------------------------------------------------------------------
+    // Logical ZB parameters.
+    //
+    // Each ZB occupies exactly one 16-bit Holding Register in every group.
+    //
+    // ZB1 uses the base address.
+    // ZB2 uses base + 1.
+    // ...
+    // ZB9 uses base + 8.
+    // ------------------------------------------------------------------------
+    const quint16 baseHighSensitivity = 9224;
+    const quint16 baseLowSensitivity  = 9233;
+    const quint16 baseValid           = 9242;
+    const quint16 baseDeviceConnection = 9251;
+    const quint16 baseReadyToDrain    = 9269;
 
 
     // ------------------------------------------------------------------------
@@ -393,11 +469,15 @@ void ApplicationController::writeZBToPLC(
     const quint16 iso5Conc = 9373;
 
 
-    const int idx = zbNumber - 1;
+    // ------------------------------------------------------------------------
+    // Convert ZB number 1..9 to zero-based index 0..8.
+    // ------------------------------------------------------------------------
+    const int idx =
+        zbNumber - 1;
 
 
     // ========================================================================
-    // SERIAL NUMBER
+    // 2. SERIAL NUMBER
     // ========================================================================
 
     if (data.contains("sn"))
@@ -416,7 +496,7 @@ void ApplicationController::writeZBToPLC(
 
 
     // ========================================================================
-    // TEMPERATURE
+    // 3. TEMPERATURE
     // ========================================================================
 
     if (data.contains("temperature"))
@@ -435,7 +515,7 @@ void ApplicationController::writeZBToPLC(
 
 
     // ========================================================================
-    // PAED
+    // 4. PAED
     // ========================================================================
 
     if (data.contains("paed"))
@@ -454,7 +534,225 @@ void ApplicationController::writeZBToPLC(
 
 
     // ========================================================================
-    // ISOTOPES
+    // 5. LOGICAL ZB PARAMETERS
+    //
+    // According to the current PLC specification all logical values are
+    // transferred through Holding Registers as int16 values 0 or 1.
+    //
+    // No Coil write is used here.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // Local helper for writing one logical parameter.
+    //
+    // The helper:
+    //   1. checks whether the field exists in incoming JSON;
+    //   2. verifies that the JSON value is numeric;
+    //   3. accepts only integer value 0 or 1;
+    //   4. writes one Holding Register.
+    //
+    // Invalid values are not written to PLC.
+    // ------------------------------------------------------------------------
+    const auto writeLogicalRegister =
+        [this, &data, zbNumber](
+            const char *jsonField,
+            quint16 address
+            )
+    {
+        // ----------------------------------------------------------------
+        // Missing field means that this parameter was simply not supplied
+        // by Python in the current command.
+        // ----------------------------------------------------------------
+        if (!data.contains(jsonField))
+        {
+            return;
+        }
+
+
+        const QJsonValue jsonValue =
+            data.value(jsonField);
+
+
+        // ----------------------------------------------------------------
+        // Logical PLC values must be numeric.
+        // ----------------------------------------------------------------
+        if (!jsonValue.isDouble())
+        {
+            qWarning()
+            << "[APP] Invalid logical value for ZB"
+            << zbNumber
+            << ", field"
+            << jsonField
+            << ": numeric value 0 or 1 expected";
+
+            return;
+        }
+
+
+        const double rawValue =
+            jsonValue.toDouble();
+
+
+        // ----------------------------------------------------------------
+        // Accept only exact integer values 0 and 1.
+        //
+        // Values such as:
+        //
+        //     -1
+        //      2
+        //      0.5
+        //
+        // must never be sent to a logical PLC register.
+        // ----------------------------------------------------------------
+        if (rawValue != 0.0 &&
+            rawValue != 1.0)
+        {
+            qWarning()
+            << "[APP] Invalid logical value for ZB"
+            << zbNumber
+            << ", field"
+            << jsonField
+            << ":"
+            << rawValue
+            << "(expected 0 or 1)";
+
+            return;
+        }
+
+
+        const quint16 plcValue =
+            static_cast<quint16>(
+                rawValue
+                );
+
+
+        // ----------------------------------------------------------------
+        // Write one 16-bit Holding Register.
+        //
+        // ModBusClient applies m_addressOffset internally.
+        // ----------------------------------------------------------------
+        const bool writeSuccessful =
+            m_modBusClient->writeHoldingRegister(
+                address,
+                plcValue
+                );
+
+
+        if (!writeSuccessful)
+        {
+            qWarning()
+            << "[APP] Failed to write logical parameter for ZB"
+            << zbNumber
+            << ", field"
+            << jsonField
+            << ", address"
+            << address;
+        }
+    };
+
+
+    // ------------------------------------------------------------------------
+    // High-sensitivity channel state.
+    //
+    // PLC addresses:
+    //
+    //     ZB1 -> 9224
+    //     ...
+    //     ZB9 -> 9232
+    //
+    // The value is written exactly as received from Python.
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "high_sensitivity",
+        static_cast<quint16>(
+            baseHighSensitivity + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Low-sensitivity channel state.
+    //
+    // PLC addresses:
+    //
+    //     ZB1 -> 9233
+    //     ...
+    //     ZB9 -> 9241
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "low_sensitivity",
+        static_cast<quint16>(
+            baseLowSensitivity + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Measurement validity state.
+    //
+    // PLC addresses:
+    //
+    //     ZB1 -> 9242
+    //     ...
+    //     ZB9 -> 9250
+    //
+    // IMPORTANT:
+    // The Bridge does not reinterpret or invert this value.
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "valid",
+        static_cast<quint16>(
+            baseValid + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Device connection state.
+    //
+    // PLC addresses:
+    //
+    //     ZB1 -> 9251
+    //     ...
+    //     ZB9 -> 9259
+    //
+    // PLC meaning:
+    //
+    //     0 = disconnected
+    //     1 = connected
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "device_connection",
+        static_cast<quint16>(
+            baseDeviceConnection + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Ready-to-drain state.
+    //
+    // PLC addresses:
+    //
+    //     ZB1 -> 9269
+    //     ...
+    //     ZB9 -> 9277
+    //
+    // PLC meaning:
+    //
+    //     0 = not ready
+    //     1 = ready
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "ready_to_drain",
+        static_cast<quint16>(
+            baseReadyToDrain + idx
+            )
+        );
+
+
+    // ========================================================================
+    // 6. ISOTOPES
     // ========================================================================
 
     const QJsonArray isotopes =
@@ -639,51 +937,122 @@ void ApplicationController::writeZBToPLC(
     }
 
 
+    // ========================================================================
+    // 7. OPERATION COMPLETED
+    // ========================================================================
+
     qDebug()
         << QString(
                "[WRITE] Tank ZB%1: data written"
-               ).arg(zbNumber);
+               ).arg(
+                   zbNumber
+                   );
 }
+
+
+
+
+
+
+
+
+
 
 
 // ============================================================================
 // ApplicationController::writeCZToPLC
 //
-// Writes wall detector data received from Python to PLC.
+// Writes CZ wall-detector data received from Python to PLC.
+//
+// The method handles:
+//
+//     - device serial number;
+//     - temperature;
+//     - PAED;
+//     - high-sensitivity channel state;
+//     - low-sensitivity channel state;
+//     - measurement validity;
+//     - device connection state.
+//
+// Logical PLC parameters are stored as one 16-bit Holding Register each.
+//
+// The Bridge does not invert logical values received from Python.
+// Values are written exactly according to the PLC register map:
+//
+//     0 -> logical state 0
+//     1 -> logical state 1
+//
+// Only values 0 and 1 are accepted for logical registers.
+// Invalid logical values are ignored and reported in the application log.
+//
+// ModBusClient applies the configured address offset internally, therefore
+// all addresses in this method are logical addresses from the PLC register
+// table.
 // ============================================================================
 void ApplicationController::writeCZToPLC(
     int czNumber,
     const QJsonObject &data
     )
 {
-    if (m_shuttingDown) {
-        return;
-    }
-
-
-    if (!m_modBusClient ||
-        !m_modBusClient->isConnected())
+    // ------------------------------------------------------------------------
+    // Do not start new PLC operations during application shutdown.
+    // ------------------------------------------------------------------------
+    if (m_shuttingDown)
     {
-        qWarning() << "[ERROR] No connection to PLC";
-
         return;
     }
 
 
     // ------------------------------------------------------------------------
-    // Base PLC addresses for CZ devices.
+    // PLC must be connected before any write operation.
+    // ------------------------------------------------------------------------
+    if (!m_modBusClient ||
+        !m_modBusClient->isConnected())
+    {
+        qWarning()
+        << "[ERROR] No connection to PLC";
+
+        return;
+    }
+
+
+    // ========================================================================
+    // 1. PLC REGISTER MAP
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // Main CZ parameters.
     // ------------------------------------------------------------------------
     const quint16 baseSN   = 9281;
     const quint16 baseTemp = 9287;
     const quint16 basePaed = 9293;
 
 
+    // ------------------------------------------------------------------------
+    // Logical CZ parameters.
+    //
+    // Each CZ device occupies exactly one 16-bit Holding Register
+    // in every logical parameter group.
+    //
+    // CZ1 uses the base address.
+    // CZ2 uses base + 1.
+    // CZ3 uses base + 2.
+    // ------------------------------------------------------------------------
+    const quint16 baseHighSensitivity  = 9299;
+    const quint16 baseLowSensitivity   = 9302;
+    const quint16 baseValid            = 9305;
+    const quint16 baseDeviceConnection = 9308;
+
+
+    // ------------------------------------------------------------------------
+    // Convert CZ number 1..3 to zero-based index 0..2.
+    // ------------------------------------------------------------------------
     const int idx =
         czNumber - 1;
 
 
     // ========================================================================
-    // SERIAL NUMBER
+    // 2. SERIAL NUMBER
     // ========================================================================
 
     if (data.contains("sn"))
@@ -702,7 +1071,7 @@ void ApplicationController::writeCZToPLC(
 
 
     // ========================================================================
-    // TEMPERATURE
+    // 3. TEMPERATURE
     // ========================================================================
 
     if (data.contains("temperature"))
@@ -721,7 +1090,7 @@ void ApplicationController::writeCZToPLC(
 
 
     // ========================================================================
-    // PAED
+    // 4. PAED
     // ========================================================================
 
     if (data.contains("paed"))
@@ -739,11 +1108,229 @@ void ApplicationController::writeCZToPLC(
     }
 
 
+    // ========================================================================
+    // 5. LOGICAL CZ PARAMETERS
+    //
+    // According to the current PLC specification all logical values are
+    // transferred through Holding Registers as int16 values 0 or 1.
+    //
+    // No Coil write is used here.
+    // ========================================================================
+
+    // ------------------------------------------------------------------------
+    // Local helper for writing one logical parameter.
+    //
+    // The helper:
+    //   1. checks whether the field exists in incoming JSON;
+    //   2. verifies that the JSON value is numeric;
+    //   3. accepts only integer value 0 or 1;
+    //   4. writes one Holding Register.
+    //
+    // Invalid values are not written to PLC.
+    // ------------------------------------------------------------------------
+    const auto writeLogicalRegister =
+        [this, &data, czNumber](
+            const char *jsonField,
+            quint16 address
+            )
+    {
+        // ----------------------------------------------------------------
+        // Missing field means that this parameter was not supplied
+        // by Python in the current command.
+        // ----------------------------------------------------------------
+        if (!data.contains(jsonField))
+        {
+            return;
+        }
+
+
+        const QJsonValue jsonValue =
+            data.value(jsonField);
+
+
+        // ----------------------------------------------------------------
+        // Logical PLC values must be numeric.
+        // ----------------------------------------------------------------
+        if (!jsonValue.isDouble())
+        {
+            qWarning()
+            << "[APP] Invalid logical value for CZ"
+            << czNumber
+            << ", field"
+            << jsonField
+            << ": numeric value 0 or 1 expected";
+
+            return;
+        }
+
+
+        const double rawValue =
+            jsonValue.toDouble();
+
+
+        // ----------------------------------------------------------------
+        // Accept only exact integer values 0 and 1.
+        //
+        // Values such as:
+        //
+        //     -1
+        //      2
+        //      0.5
+        //
+        // must never be sent to a logical PLC register.
+        // ----------------------------------------------------------------
+        if (rawValue != 0.0 &&
+            rawValue != 1.0)
+        {
+            qWarning()
+            << "[APP] Invalid logical value for CZ"
+            << czNumber
+            << ", field"
+            << jsonField
+            << ":"
+            << rawValue
+            << "(expected 0 or 1)";
+
+            return;
+        }
+
+
+        const quint16 plcValue =
+            static_cast<quint16>(
+                rawValue
+                );
+
+
+        // ----------------------------------------------------------------
+        // Write one 16-bit Holding Register.
+        //
+        // ModBusClient applies m_addressOffset internally.
+        // ----------------------------------------------------------------
+        const bool writeSuccessful =
+            m_modBusClient->writeHoldingRegister(
+                address,
+                plcValue
+                );
+
+
+        if (!writeSuccessful)
+        {
+            qWarning()
+            << "[APP] Failed to write logical parameter for CZ"
+            << czNumber
+            << ", field"
+            << jsonField
+            << ", address"
+            << address;
+        }
+    };
+
+
+    // ------------------------------------------------------------------------
+    // High-sensitivity channel state.
+    //
+    // PLC addresses:
+    //
+    //     CZ1 -> 9299
+    //     CZ2 -> 9300
+    //     CZ3 -> 9301
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "high_sensitivity",
+        static_cast<quint16>(
+            baseHighSensitivity + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Low-sensitivity channel state.
+    //
+    // PLC addresses:
+    //
+    //     CZ1 -> 9302
+    //     CZ2 -> 9303
+    //     CZ3 -> 9304
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "low_sensitivity",
+        static_cast<quint16>(
+            baseLowSensitivity + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Measurement validity state.
+    //
+    // PLC addresses:
+    //
+    //     CZ1 -> 9305
+    //     CZ2 -> 9306
+    //     CZ3 -> 9307
+    //
+    // IMPORTANT:
+    // The Bridge does not reinterpret or invert this value.
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "valid",
+        static_cast<quint16>(
+            baseValid + idx
+            )
+        );
+
+
+    // ------------------------------------------------------------------------
+    // Device connection state.
+    //
+    // PLC addresses:
+    //
+    //     CZ1 -> 9308
+    //     CZ2 -> 9309
+    //     CZ3 -> 9310
+    //
+    // PLC meaning:
+    //
+    //     0 = disconnected
+    //     1 = connected
+    // ------------------------------------------------------------------------
+    writeLogicalRegister(
+        "device_connection",
+        static_cast<quint16>(
+            baseDeviceConnection + idx
+            )
+        );
+
+
+    // ========================================================================
+    // 6. OPERATION COMPLETED
+    // ========================================================================
+
     qDebug()
         << QString(
                "[WRITE] Wall detector CZ%1: data written"
-               ).arg(czNumber);
+               ).arg(
+                   czNumber
+                   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ============================================================================
@@ -804,22 +1391,32 @@ void ApplicationController::onPythonDataReceived()
 }
 
 
+
 // ============================================================================
 // ApplicationController::checkWatchdog
 //
-// Checks Python activity and controls PLC watchdog Coil 9035.
+// Checks Python activity and controls PLC watchdog Holding Register 9035.
 //
 // The method is called every 10 seconds by m_watchdogTimer.
 //
 // Python is considered inactive if no working command has been received
 // for more than 5 minutes.
 //
+// PLC representation:
+//
+//     1 = Python application is active
+//     0 = Python application is inactive
+//
 // IMPORTANT:
-// Coil 9035 is NOT written on every watchdog timer cycle.
+// Holding Register 9035 is NOT written on every watchdog timer cycle.
 // A Modbus write is performed only when:
 //     1. the watchdog state changes;
 //     2. the watchdog state is unknown, for example after PLC reconnect.
+//
+// The watchdog state is stored in PLC as one 16-bit Holding Register.
+// Boolean state is converted to int16 value 0 or 1 before writing.
 // ============================================================================
+
 void ApplicationController::checkWatchdog()
 {
     // ------------------------------------------------------------------------
@@ -832,11 +1429,12 @@ void ApplicationController::checkWatchdog()
 
 
     // ------------------------------------------------------------------------
-    // The watchdog Coil cannot be written while PLC is disconnected.
+    // The watchdog Holding Register cannot be written while PLC is
+    // disconnected.
     //
     // In this case the cached state is marked as unknown.
     // After PLC reconnect the next watchdog check will force synchronization
-    // of Coil 9035 with the current Python activity state.
+    // of Holding Register 9035 with the current Python activity state.
     // ------------------------------------------------------------------------
     if (!m_modBusClient ||
         !m_modBusClient->isConnected())
@@ -866,8 +1464,12 @@ void ApplicationController::checkWatchdog()
     // ------------------------------------------------------------------------
     // Required watchdog state:
     //
-    //     true  -> Python is active  -> Coil 9035 = ON
-    //     false -> Python timeout    -> Coil 9035 = OFF
+    //     true  -> Python is active  -> Holding Register 9035 = 1
+    //     false -> Python timeout    -> Holding Register 9035 = 0
+    //
+    // The internal watchdog logic remains boolean.
+    // Only the Modbus representation changes from Coil to int16 value 0/1
+    // stored in one Holding Register.
     // ------------------------------------------------------------------------
     const bool requiredWatchdogState =
         millisecondsSinceLastData <= WATCHDOG_TIMEOUT_MS;
@@ -888,14 +1490,28 @@ void ApplicationController::checkWatchdog()
 
 
     // ------------------------------------------------------------------------
+    // Convert the internal boolean state to the PLC representation:
+    //
+    //     false -> int16 value 0
+    //     true  -> int16 value 1
+    //
+    // Address 9035 remains unchanged.
+    // ModBusClient::writeHoldingRegister() applies the configured address
+    // offset internally.
+    // ------------------------------------------------------------------------
+    const quint16 watchdogValue =
+        requiredWatchdogState ? 1 : 0;
+
+
+    // ------------------------------------------------------------------------
     // The watchdog state has changed, or its current PLC state is unknown.
     //
-    // Write the required value to Coil 9035.
+    // Write one 16-bit Holding Register using Modbus Function Code 0x06.
     // ------------------------------------------------------------------------
     const bool writeSuccessful =
-        m_modBusClient->writeCoil(
+        m_modBusClient->writeHoldingRegister(
             9035,
-            requiredWatchdogState
+            watchdogValue
             );
 
 
@@ -909,7 +1525,7 @@ void ApplicationController::checkWatchdog()
         m_watchdogStateKnown = false;
 
         qWarning()
-            << "[WATCHDOG] Failed to update Coil 9035";
+            << "[WATCHDOG] Failed to update Holding Register 9035";
 
         return;
     }
@@ -930,17 +1546,14 @@ void ApplicationController::checkWatchdog()
     if (requiredWatchdogState)
     {
         qDebug()
-        << "[WATCHDOG] Python active, Coil 9035 = 1";
+        << "[WATCHDOG] Python active, Holding Register 9035 = 1";
     }
     else
     {
         qDebug()
-        << "[WATCHDOG] Python activity timeout, Coil 9035 = 0";
+        << "[WATCHDOG] Python activity timeout, Holding Register 9035 = 0";
     }
 }
-
-
-
 
 
 
@@ -955,15 +1568,53 @@ void ApplicationController::checkWatchdog()
 // ============================================================================
 // ApplicationController::readFullnessAndSend
 //
-// Reads the fullness state of nine ZB tanks and sends the result to Python.
+// Reads the fullness state of all nine ZB tanks from PLC and sends the result
+// to the connected Python application.
+//
+// According to the current PLC register map, tank fullness is stored in:
+//
+//     ZB1 -> Holding Register 9260
+//     ZB2 -> Holding Register 9261
+//     ZB3 -> Holding Register 9262
+//     ZB4 -> Holding Register 9263
+//     ZB5 -> Holding Register 9264
+//     ZB6 -> Holding Register 9265
+//     ZB7 -> Holding Register 9266
+//     ZB8 -> Holding Register 9267
+//     ZB9 -> Holding Register 9268
+//
+// Each logical value is stored as one 16-bit Holding Register:
+//
+//     0 = tank is empty
+//     1 = tank is full
+//
+// IMPORTANT:
+// The Python protocol remains unchanged. Python still receives:
+//
+//     "fullness": 0
+//
+// or:
+//
+//     "fullness": 1
+//
+// ModBusClient::readHoldingRegister() applies the configured address offset
+// internally, therefore the logical PLC addresses above are used here without
+// any manual address correction.
 // ============================================================================
 void ApplicationController::readFullnessAndSend()
 {
-    if (m_shuttingDown) {
+    // ------------------------------------------------------------------------
+    // Do not start new PLC operations during application shutdown.
+    // ------------------------------------------------------------------------
+    if (m_shuttingDown)
+    {
         return;
     }
 
 
+    // ------------------------------------------------------------------------
+    // Both ModBusClient and LocalServer are required for this operation.
+    // ------------------------------------------------------------------------
     if (!m_modBusClient ||
         !m_localServer)
     {
@@ -974,9 +1625,10 @@ void ApplicationController::readFullnessAndSend()
     // ------------------------------------------------------------------------
     // If PLC is temporarily unavailable, skip this polling cycle.
     //
-    // ModBusClient is responsible for reconnecting.
+    // ModBusClient is responsible for restoring the PLC connection.
     // ------------------------------------------------------------------------
-    if (!m_modBusClient->isConnected()) {
+    if (!m_modBusClient->isConnected())
+    {
         return;
     }
 
@@ -985,32 +1637,73 @@ void ApplicationController::readFullnessAndSend()
 
 
     // ------------------------------------------------------------------------
-    // Existing PLC address map:
+    // Current PLC register map:
     //
-    //   ZB1 -> Coil 10260
-    //   ...
-    //   ZB9 -> Coil 10268
+    //     ZB1 -> Holding Register 9260
+    //     ...
+    //     ZB9 -> Holding Register 9268
+    //
+    // Each register contains one int16 logical value:
+    //
+    //     0 = empty
+    //     1 = full
     // ------------------------------------------------------------------------
+    constexpr quint16 FULLNESS_BASE_ADDRESS = 9260;
+
+
     for (int i = 1; i <= 9; ++i)
     {
         const quint16 address =
             static_cast<quint16>(
-                10260 + (i - 1)
+                FULLNESS_BASE_ADDRESS + (i - 1)
                 );
 
 
-        bool full = false;
+        // --------------------------------------------------------------------
+        // PLC stores the logical state as one 16-bit Holding Register.
+        // --------------------------------------------------------------------
+        quint16 fullnessValue = 0;
 
 
-        if (m_modBusClient->readCoil(
+        if (m_modBusClient->readHoldingRegister(
                 address,
-                full
+                fullnessValue
                 ))
         {
+            // ----------------------------------------------------------------
+            // Only values 0 and 1 are valid according to the PLC register map.
+            //
+            // Do not silently convert an unexpected PLC value such as 2, 100
+            // or 65535 into a valid logical state. Such a value indicates an
+            // incorrect PLC state or register configuration.
+            // ----------------------------------------------------------------
+            if (fullnessValue > 1)
+            {
+                qWarning()
+                << "[APP] Invalid fullness value for ZB"
+                << i
+                << ":"
+                << fullnessValue
+                << "(expected 0 or 1)";
+
+                continue;
+            }
+
+
             QJsonObject zb;
 
             zb["number"] = i;
-            zb["fullness"] = full ? 1 : 0;
+
+            // ----------------------------------------------------------------
+            // Preserve the existing Python protocol.
+            //
+            // The PLC int16 value is forwarded as JSON integer 0 or 1.
+            // ----------------------------------------------------------------
+            zb["fullness"] =
+                static_cast<int>(
+                    fullnessValue
+                    );
+
 
             zbArray.append(zb);
         }
@@ -1024,7 +1717,17 @@ void ApplicationController::readFullnessAndSend()
 
 
     // ------------------------------------------------------------------------
-    // Preserve the existing Python protocol format.
+    // Preserve the existing Bridge -> Python JSON protocol:
+    //
+    // {
+    //     "type": "read",
+    //     "data": {
+    //         "zb": [
+    //             { "number": 1, "fullness": 0 },
+    //             ...
+    //         ]
+    //     }
+    // }
     // ------------------------------------------------------------------------
     QJsonObject response;
 
@@ -1039,12 +1742,13 @@ void ApplicationController::readFullnessAndSend()
     response["data"] = data;
 
 
-    m_localServer->broadcast(response);
+    // ------------------------------------------------------------------------
+    // Send the current tank states to all connected Python clients.
+    // ------------------------------------------------------------------------
+    m_localServer->broadcast(
+        response
+        );
 }
-
-
-
-
 
 
 
